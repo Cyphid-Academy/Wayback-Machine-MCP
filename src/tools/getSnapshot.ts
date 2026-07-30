@@ -111,7 +111,7 @@ export const getSnapshotTool: ToolModule = defineTool<Input, Output>({
     if (extractionSuspect) {
       lines.push(
         '',
-        `Only ${count(payload.totalChars)} characters extracted from a ${bytes(artifactBytes)} HTML capture. This page probably renders its content client-side; the Wayback capture may contain only the shell. Try format="raw" to inspect.`,
+        `Only ${count(payload.totalChars)} characters extracted from a ${bytes(value.byteLength)} HTML capture. This page probably renders its content client-side; the Wayback capture may contain only the shell. Try format="raw" to inspect.`,
       );
     }
 
