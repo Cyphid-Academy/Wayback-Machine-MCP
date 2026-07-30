@@ -11,3 +11,27 @@ run = ["npm", "run", "start"]
 [[ports]]
 localPort = 3000
 externalPort = 80
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Wayback Machine MCP Server"
+
+[[workflows.workflow]]
+name = "Wayback Machine MCP Server"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "npm run dev"
+waitForPort = 3000
+
+[workflows.workflow.metadata]
+outputType = "webview"
