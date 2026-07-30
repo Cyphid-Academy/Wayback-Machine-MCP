@@ -15,7 +15,7 @@ import { InMemoryCache, type CacheBackend } from './lib/cache.js';
 import { InMemoryTokenBucket, type RateLimiter } from './lib/ratelimit.js';
 import { FetchUpstreamClient, type UpstreamClient } from './lib/http.js';
 import { createLogger, type Logger } from './lib/log.js';
-import { DIFF_INLINE_CAP, buildDiff } from './lib/diff.js';
+import { buildDiff } from './lib/diff.js';
 import type { Failure } from './lib/errors.js';
 import { fetchCapture, fetchCaptureText, resolveTimestamp } from './lib/wayback.js';
 

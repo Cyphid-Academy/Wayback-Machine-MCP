@@ -5,7 +5,7 @@ import { normalizeTargetUrl, waybackCaptureUrl } from '../lib/urls.js';
 import { timestampToIso } from '../lib/timestamps.js';
 import { mimeTypeForFormat, resourceLink, snapshotResourceUri, textPayload, type ResourceLinkBlock } from '../lib/resources.js';
 import { defineTool, fail, succeed, type ToolModule } from './define.js';
-import { bytes, count, shortDateTime, summary } from './format.js';
+import { bytes, count, shortDateTime } from './format.js';
 
 type Input = z.infer<typeof getSnapshotInput>;
 type Output = z.infer<typeof getSnapshotOutput>;
