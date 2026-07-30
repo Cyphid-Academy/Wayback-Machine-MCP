@@ -39,6 +39,12 @@ Concretely:
 - Diffs are capped at **15,000 characters**, with a `ResourceLink` to the full diff beyond that.
 - Table-shaped results (capture rows, revisions) are trimmed to 250 rows, and the tool tells the caller how to page.
 
+Both character limits are the *defaults*. Because claude.ai turns out not to fetch
+resource links (see `DECISIONS-MADE.md`), `get_snapshot` and `compare_snapshots`
+accept a `maxChars` parameter — up to 100,000 — that inlines more text directly.
+That is opt-in escalation, not paging: there is no `offset`, and a document is
+never chunked across calls.
+
 ---
 
 ## Tools
@@ -47,8 +53,10 @@ Cheap orientation tools first. Every tool declares an `outputSchema` and
 populates `structuredContent`.
 
 ### `archive_stats` — recommended first call
-How much history exists for a URL: total captures, first and last capture,
-per-year breakdown. One request, no page content.
+How much history exists for a URL: total captures, first and last capture, a
+per-year breakdown, and counts split by HTTP status class with the 200-only date
+range reported separately. One request, no page content. The status breakdown is
+what tells you a URL has moved rather than changed.
 
 | Parameter | Type | Default |
 |---|---|---|
@@ -84,12 +92,18 @@ have only eight distinct bodies; this returns one row per revision with
 `revisionIndex`, `digest`, `firstSeen`, `lastSeen` and `captureCount`. Feed two
 `firstSeen` values to `compare_snapshots`.
 
+Grouping is by CDX content digest where that works, and by a hash of the extracted
+text where it does not — see Limitations. `method` forces one or the other. The
+output always reports which was used, how many captures were examined and how many
+were excluded.
+
 | Parameter | Type | Default |
 |---|---|---|
 | `url` | string, required | |
 | `from`, `to` | date | |
 | `maxCaptures` | int, 10–10000 | 3000 |
 | `includeRedirects` | bool | `false` |
+| `method` | `auto` \| `digest` \| `text` | `auto` |
 
 ### `get_snapshot`
 One capture as chrome-stripped text or markdown. Fetched with the `id_` modifier
@@ -102,15 +116,21 @@ footers, cookie banners and language switchers are removed before extraction.
 | `timestamp` | timestamp \| `latest` \| `earliest` | `latest` |
 | `format` | `text` \| `markdown` \| `raw` | `text` |
 | `modifier` | `id_` \| `if_` \| `im_` \| `js_` \| `cs_` | `id_` |
+| `maxChars` | int, 500–100000 | 8000 |
 
 `format=raw` never inlines the bytes; it returns metadata, a text preview and a
-`ResourceLink`.
+`ResourceLink`. A partial date resolves to the nearest capture, and the result
+reports `offsetDays` — plus a prominent note when the gap exceeds three days — so
+content is never misattributed to the date you asked for. Raise `maxChars` to
+inline more text instead of following a resource link.
 
 ### `compare_snapshots`
 Diffs two captures and returns only what changed: added/removed characters,
 changed-section count, the Wayback visual-diff URL, and a unified diff capped at
-15,000 characters. Both captures are fetched via `id_` and stripped of chrome
-first, so the diff shows content changes rather than banner noise.
+15,000 characters by default (raise `maxChars` for more). Both captures are fetched
+via `id_` and stripped of chrome first, so the diff shows content changes rather
+than banner noise. Each endpoint reports what you asked for alongside what was
+actually fetched, so a change is never dated to the wrong day.
 
 | Parameter | Type | Default |
 |---|---|---|
@@ -118,6 +138,7 @@ first, so the diff shows content changes rather than banner noise.
 | `timestampA` | timestamp \| `earliest` \| `latest` | earliest capture |
 | `timestampB` | timestamp \| `earliest` \| `latest` | latest capture |
 | `granularity` | `line` \| `word` | `line` |
+| `maxChars` | int, 1000–100000 | 15000 |
 
 ### `list_screenshots`
 Screenshot captures for a URL — timestamps and URLs only, never image bytes.
@@ -182,6 +203,12 @@ scale-to-zero without any persistence layer.
 | `GET /healthz` | `200 ok` immediately, touching nothing |
 | `GET /` | Server info: name, version, protocol versions, tool names. Never the secret. |
 
+Resource URIs are built from the **`Host` header of the request that produced
+them** (honouring `X-Forwarded-Proto`), so a link emitted by the deployment points
+at the deployment. `DEPLOY_URL` is only the fallback for a caller that sends no
+Host. A server whose links would point at a `*.replit.dev` workspace domain warns
+about it once at boot.
+
 `{timestamp}` accepts `latest`, `earliest` or any date form. The target URL may be
 percent-encoded, passed un-encoded in the path tail, or supplied as `?url=`.
 Responses carry `Cache-Control: public, max-age=86400` because captures are
@@ -208,7 +235,7 @@ Other scripts:
 ```bash
 npm run build       # tsc -> dist/
 npm start           # node dist/index.js
-npm test            # 216 unit + integration tests, no network access
+npm test            # 259 unit + integration tests, no network access
 npm run typecheck   # strict typecheck including the test suite
 ```
 
@@ -356,6 +383,8 @@ What ships instead, behind swappable interfaces:
 - **The first connector handshake after an idle period will probably time out.** Autoscale scales to zero after ~15 minutes idle and cold-starts in 10–30s, while the client wants a response sooner. Retrying once connects. If it becomes annoying, move to a Reserved VM rather than optimising further.
 - **Tool results are size-capped.** Page text over 8,000 characters and diffs over 15,000 characters are not inlined; you get a preview plus a `ResourceLink`. Row-shaped results are trimmed to 250 rows and tell you how to page. This is the constraint the whole design exists to satisfy — an oversized result would fail the call outright.
 - **Whether claude.ai resolves a `ResourceLink` from a tool result is unverified.** If it does not, nothing breaks: `archive_stats`, `list_revisions` and `compare_snapshots` return everything needed inline, and the `/r/...` routes stay useful from Claude Code, Cowork and a browser. See `DECISIONS-MADE.md`.
+- **CDX content digests are unreliable on many modern pages.** The Wayback digest is a hash of the delivered bytes, so a Next.js build id or an embedded per-request nonce changes it on every capture even when the visible text is identical. `list_revisions` detects this (distinct digests approaching one per capture) and falls back to hashing the chrome-stripped text of up to 24 evenly-spaced captures. That works, but it is **sampled**: revision boundaries are accurate to the sampling interval rather than to the day. Narrow `from`/`to` and re-run to sharpen a boundary. The output always says which method produced it. Text mode costs one capture fetch per sample, so it is bounded by the rate limiter — raising `RATE_LIMIT_PER_MINUTE` gives a finer sample.
+- **Client-rendered pages extract to almost nothing.** If the text lives in JavaScript that never ran, there is no text in the capture to extract, whatever `format` you ask for. Both Anthropic pricing pages are examples: the capture is a shell. `archive_stats` and `search_snapshots` still work on them; `get_snapshot` and `compare_snapshots` will look empty, and that is the capture's fault rather than the extractor's.
 - **Chrome stripping is heuristic.** `nav`, `header`, `footer`, `aside`, cookie banners and language switchers are removed, which is what makes diffs readable — but a page that puts real content in a `<header>` will lose it. Use `format=raw` (via the resource route) to see the untouched capture.
 - **`list_screenshots` is unverified against the live CDX index.** It queries the `screenshot:` pseudo-URL, which is how Save Page Now screenshots are indexed; it could not be exercised against the real service from the build environment.
 - **`list_revisions` groups *consecutive* identical digests.** A page that reverts to an earlier body reports two separate revisions with the same digest, which is the honest answer — `distinctDigests` tells you how many unique bodies there were.
@@ -368,7 +397,7 @@ What ships instead, behind swappable interfaces:
 npm test
 ```
 
-216 tests, no network access: unit tests over timestamp normalisation, CDX
+259 tests, no network access: unit tests over timestamp normalisation, CDX
 parsing, HTML extraction (including nav and language-list stripping), the
 8,000-character ResourceLink threshold, diff capping, cache TTL and eviction, the
 token bucket, auth and origin policy, and the upstream client's retry,
@@ -385,14 +414,23 @@ or navigation noise in the diff.
 
 Run this in claude.ai once the connector is attached:
 
-> Enumerate the distinct content revisions of
-> `support.anthropic.com/en/articles/8325612` from 2023-09-01 to today, then diff
-> the earliest against the latest.
+> Find every distinct revision of
+> `support.anthropic.com/en/articles/8325612-does-claude-pro-have-any-usage-limits`
+> and tell me when the message allowance changed.
 
-**Pass criteria:** `list_revisions` returns roughly 5–20 digest-distinct
-revisions, not hundreds. `compare_snapshots` returns a readable diff in which the
-Claude Pro message-limit language visibly changes — the older capture mentioning
-100 messages per 8 hours, the newer 45 messages per 5 hours.
+Note the slug. The bare-ID form of that URL has **no captures of its own** — the
+archived URL carries the full slug, which is exactly what `search_snapshots` with
+`matchType: "prefix"` is for.
+
+**Pass criteria:** a single-digit revision count, and a correctly identified
+two-stage change in **April 2024** — first the window (8 hours → 5 hours, warning
+20 → 10, with the trailing "reset every 8 hours" left stale), then the allowance
+(100 → 45, warning 10 → 7, trailing sentence corrected). Both edits bracketed to
+within about a week without manual bisection.
+
+This page defeats CDX digest grouping (88 captures, 88 distinct digests), so
+`list_revisions` will report that it fell back to text-digest mode — that is the
+expected path, not a failure.
 
 **If it fails, diagnose in this order:**
 

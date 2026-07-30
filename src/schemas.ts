@@ -51,6 +51,15 @@ const matchTypeField = z
 
 export const archiveStatsInput = z.object({ url: urlField });
 
+export const statusBreakdownSchema = z.object({
+  total: z.number(),
+  ok: z.number(),
+  redirects: z.number(),
+  clientErrors: z.number(),
+  serverErrors: z.number(),
+  other: z.number(),
+});
+
 export const archiveStatsOutput = z.object({
   url: z.string(),
   totalCaptures: z.number(),
@@ -58,9 +67,18 @@ export const archiveStatsOutput = z.object({
   lastCapture: z.string().nullable(),
   firstCaptureIso: z.string().nullable(),
   lastCaptureIso: z.string().nullable(),
+  /** Capture counts split by HTTP status class, so exclusions are never silent. */
+  byStatusClass: statusBreakdownSchema,
+  /** Range covering only HTTP 200 captures — the ones the reading tools can use. */
+  contentFirstCapture: z.string().nullable(),
+  contentLastCapture: z.string().nullable(),
+  /** Share of captures that are redirects, 0-1. A high value means the page moved. */
+  redirectShare: z.number(),
   byYear: z.record(z.string(), z.number()),
-  /** 'sparkline' is the cheap aggregate endpoint; 'cdx' is the fallback count. */
+  /** 'sparkline' is the cheap aggregate endpoint; 'cdx' gives the status breakdown. */
   source: z.enum(['sparkline', 'cdx']),
+  /** True when the capture list hit the query cap and the counts are lower bounds. */
+  capturesTruncated: z.boolean(),
   calendarUrl: z.string(),
 });
 
@@ -128,6 +146,9 @@ export const searchSnapshotsOutput = z.object({
   url: z.string(),
   matchType: z.string(),
   rows: z.array(snapshotRowSchema),
+  /** Distinct `original` URLs among the returned rows — the point of non-exact matching. */
+  distinctUrls: z.array(z.string()),
+  distinctUrlCount: z.number(),
   totalReturned: z.number(),
   hasMore: z.boolean(),
   /** True when rows were trimmed to keep the response inside the tool-result size cap. */
@@ -154,6 +175,12 @@ export const listRevisionsInput = z.object({
     .boolean()
     .default(false)
     .describe('Include 3xx captures. Off by default so redirects do not read as content changes.'),
+  method: z
+    .enum(['auto', 'digest', 'text'])
+    .default('auto')
+    .describe(
+      'auto (default) uses fast CDX digests and falls back to sampled text digests when those turn out to be noise; digest forces CDX-only (fast, but useless on pages with per-request tokens); text forces sampled text digesting.',
+    ),
 });
 
 export const revisionRowSchema = z.object({
@@ -175,6 +202,17 @@ export const listRevisionsOutput = z.object({
   totalRevisions: z.number(),
   distinctDigests: z.number(),
   capturesExamined: z.number(),
+  /** Which grouping actually produced these revisions. */
+  method: z.enum(['digest', 'text']),
+  /** Every capture in range, before any status filtering. */
+  capturesTotal: z.number(),
+  /** How many captures were excluded, and why, so numbers never silently disagree. */
+  capturesExcluded: z.number(),
+  excludedReason: z.string().nullable(),
+  /** distinctDigests / capturesExamined. At or above 0.9 the CDX digests are noise. */
+  digestRatio: z.number(),
+  /** Captures actually fetched in text mode. 0 in digest mode. */
+  capturesSampled: z.number(),
   /** True when the capture list hit maxCaptures and older/newer captures were not examined. */
   capturesTruncated: z.boolean(),
   revisionsTruncated: z.boolean(),
@@ -202,6 +240,15 @@ export const getSnapshotInput = z.object({
     .enum(['id_', 'if_', 'im_', 'js_', 'cs_'])
     .optional()
     .describe('Wayback content modifier. Defaults to id_ (the original, unrewritten capture), which is almost always what you want.'),
+  maxChars: z
+    .number()
+    .int()
+    .min(500)
+    .max(100_000)
+    .default(8_000)
+    .describe(
+      'Inline character budget. At the default 8000 a longer page returns a 2,000-character preview plus a resource link; raise it to inline more of the text directly, which is what you want if resource links are not being fetched.',
+    ),
 });
 
 export const getSnapshotOutput = z.object({
@@ -214,10 +261,18 @@ export const getSnapshotOutput = z.object({
   mimeType: z.string(),
   title: z.string().nullable(),
   format: z.string(),
+  /** Characters of extracted text. Distinct from artifactBytes — never conflate them. */
   totalChars: z.number(),
+  /** Byte length of the artifact the resource link serves. */
+  artifactBytes: z.number(),
+  /** How many characters were actually inlined in this response. */
+  inlinedChars: z.number(),
+  maxChars: z.number(),
   /** True when only a preview is inline and the full text is behind the resource link. */
   truncated: z.boolean(),
   resourceUri: z.string().nullable(),
+  /** Signed days between the requested date and the capture actually returned. */
+  offsetDays: z.number().nullable(),
   /** True when the upstream body hit the server's byte cap. */
   bodyTruncated: z.boolean(),
 });
@@ -240,6 +295,13 @@ export const compareSnapshotsInput = z.object({
     .enum(['line', 'word'])
     .default('line')
     .describe('line = unified diff by paragraph/line (default, best for prose); word = inline word-level changes, better for small edits.'),
+  maxChars: z
+    .number()
+    .int()
+    .min(1_000)
+    .max(100_000)
+    .default(15_000)
+    .describe('Inline budget for the unified diff. Raise it to see a long diff in full rather than following a resource link.'),
 });
 
 export const compareSnapshotsOutput = z.object({
@@ -249,6 +311,11 @@ export const compareSnapshotsOutput = z.object({
   timestampAIso: z.string(),
   timestampBIso: z.string(),
   granularity: z.string(),
+  /** What was asked for versus what was fetched, for each endpoint (F3). */
+  requestedTimestampA: z.string(),
+  requestedTimestampB: z.string(),
+  offsetDaysA: z.number().nullable(),
+  offsetDaysB: z.number().nullable(),
   identical: z.boolean(),
   addedChars: z.number(),
   removedChars: z.number(),
@@ -258,7 +325,11 @@ export const compareSnapshotsOutput = z.object({
   charsA: z.number(),
   charsB: z.number(),
   diffTotalChars: z.number(),
-  /** True when the unified diff was longer than 15,000 characters and was capped. */
+  /** Byte length of the full diff artifact behind the resource link. */
+  artifactBytes: z.number(),
+  inlinedChars: z.number(),
+  maxChars: z.number(),
+  /** True when the unified diff was longer than the inline budget and was capped. */
   truncated: z.boolean(),
   resourceUri: z.string().nullable(),
   visualDiffUrl: z.string(),

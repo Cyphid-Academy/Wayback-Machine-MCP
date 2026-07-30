@@ -28,23 +28,24 @@ routing code.
 
 ### 2. Does claude.ai resolve a `ResourceLink` from a tool result?
 
-**Not determined here; probe procedure below.**
+**Settled: no, it does not.** Confirmed in live use — a `format="raw"` call returned
+the URI and its metadata, and the artifact itself never reached the model.
 
-Determining this requires a live connector. The probe: call `get_snapshot` on a
-page whose extracted text exceeds 8,000 characters (the tool will report
-`truncated: true` and attach a `ResourceLink`), then ask the model a question
-whose answer appears only *after* the 2,000-character preview. If it can answer,
-the host resolved the link; if it can only discuss the preview, it did not.
+This makes **server-side reduction load-bearing rather than a convenience**. The
+architecture is unchanged and vindicated: the whole investigation this server was
+built for was carried by `archive_stats`, `list_revisions` and `compare_snapshots`,
+all of which return their answer inline. But the consequences for the inline
+thresholds are real, and F8 acts on them:
 
-What is verified is that the link is **correct and resolvable**: the integration
-suite takes the URI the tool actually advertises, fetches it, and asserts the
-response is the complete extracted text whose length matches the `totalChars` the
-tool reported. So if the host does fetch it, it will get the right artifact.
+- The 8,000-character threshold is a **hard wall in this client**, not a soft handoff. `get_snapshot` therefore takes an opt-in `maxChars` (default 8,000, ceiling 100,000) and `compare_snapshots` takes the same (default 15,000).
+- `maxChars` means "inline up to this many characters". Only the *default* value produces the preview-plus-resource-link shape; any other value the caller sets is honoured literally, with a `[Truncated at n of m characters…]` marker. That is the least surprising reading of an explicit budget.
+- This is **opt-in escalation, not paging.** There is deliberately no `offset` parameter and no chunking of a document across calls; that design was considered and rejected because it multiplies round trips and dumps markup into context.
+- Resource links are still emitted and still correct. They remain useful from Claude Code, Cowork and a browser, and the integration suite fetches the advertised URI and asserts it serves the full artifact.
 
-Per the spec, no redesign is warranted either way: `archive_stats`,
-`list_revisions` and `compare_snapshots` return everything the acceptance test
-needs inline, and the `/r/...` routes remain useful from Claude Code, Cowork and a
-browser.
+The original probe procedure, retained in case another host needs testing: call
+`get_snapshot` on a page whose extracted text exceeds the limit, then ask a
+question whose answer appears only after the preview. If the model can answer, the
+host resolved the link.
 
 ---
 
@@ -82,6 +83,60 @@ Consequences, each one a deliberate response rather than a workaround:
 - A `403`/`401` from upstream now carries the hint that an egress proxy or
   firewall may be blocking `web.archive.org` — the failure that cost the most time
   here should be self-explaining next time.
+
+---
+
+## Fixes from first live use
+
+The defects found during the first real investigation are recorded here where the
+resolution involved a judgement call.
+
+### `search_snapshots` already carried `original` — the defect was in the summary
+
+The reported root cause (the CDX `original` field "is fetched but dropped when
+mapping rows to output") did not match the code: `original` was present in
+`structuredContent` all along. What was missing was the **text summary**, which
+printed timestamp, status, mimetype and digest but never the URL — so a caller
+reading the human-readable channel could not tell which URL a row belonged to.
+That is the same dead end in practice, so the fix stands: the URL now appears on
+every row for non-exact match types, once in the header for `exact`, plus a
+distinct-URL list capped at 50. Recorded because the diagnosis, not the symptom,
+was wrong.
+
+### `archive_stats` now reads the CDX index rather than the sparkline
+
+The sparkline endpoint is one cheap request but reports no status classes, and
+without those the tool cannot say "465 captures, of which 174 are redirects" —
+which is the whole point of F2. The CDX index is therefore the primary source and
+the sparkline is the fallback when CDX returns nothing. This costs a larger
+response (one row per capture, two fields) for a materially more honest answer,
+and `source` in the output says which path produced the numbers.
+
+### Text-digest sampling is bounded by wall clock as well as by count
+
+F4 caps text mode at 24 fetches. At the default 10 requests/minute against
+archive.org, 24 fetches would queue for roughly 2.5 minutes — beyond the 30s that
+tool calls target. Sampling therefore also stops at a 120-second budget and
+reports how many captures it actually sampled, so the answer degrades in precision
+rather than timing out. Raising `RATE_LIMIT_PER_MINUTE` buys a finer sample. Each
+sampling fetch is allowed a longer rate-limit queue (45s) than an ordinary call.
+
+### One unfetchable capture in `compare_snapshots` returns an error, not a diff
+
+F7 says "do not fail" on a single unfetchable capture. There is genuinely no diff
+to return when one side is missing, and reporting success with no diff would be
+worse than an error. The resolution: return a tool error that names **which**
+endpoint failed, states that the other endpoint fetched fine (so it is not a
+connectivity problem), and lists the three nearest usable timestamps from CDX so
+the caller can retry immediately without another round of searching.
+
+### Capture failures never blame local networking
+
+The upstream client now takes an `errorSubject`. A failed fetch of one specific
+capture reports that the capture may be unavailable upstream and suggests a
+neighbouring timestamp. Only a connect-level failure against archive.org itself
+mentions outbound network access. The retry schedule is one attempt plus three
+retries at 250ms, 1s and 3s.
 
 ---
 

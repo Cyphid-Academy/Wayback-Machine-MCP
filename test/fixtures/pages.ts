@@ -254,3 +254,150 @@ export const SEARCH_DOCS = [
   { identifier: 'apollo-11-audio', title: 'Apollo 11 Onboard Audio', creator: ['NASA', 'JSC'], date: '1969-07-20T00:00:00Z', mediatype: 'audio' },
   { identifier: 'apollo-13-report', title: 'Apollo 13 Review Board Report', creator: 'NASA', date: '1970-06-15T00:00:00Z', mediatype: 'texts' },
 ];
+
+
+// ---------------------------------------------------------------------------
+// Fixtures for the defects found in first live use (see waybackmcpFIXES.md).
+// ---------------------------------------------------------------------------
+
+/**
+ * F1: a URL whose captures live under a longer slug, so a prefix search has to
+ * report the matched URL or the caller cannot act on the result.
+ */
+export const PREFIX_STEM = 'support.example.org/en/articles/11647753';
+export const PREFIX_SLUG_A = 'support.example.org/en/articles/11647753-what-are-usage-limits';
+export const PREFIX_SLUG_B = 'support.example.org/en/articles/11647753-what-are-usage-limits/extra';
+
+export const PREFIX_CAPTURES: readonly FixtureCapture[] = [
+  { timestamp: '20250301120000', digest: 'PREFIXAAAAAAAAAAAAAAAAAAAAAAAAAA', statuscode: '200', mimetype: 'text/html', length: '9000' },
+  { timestamp: '20250401120000', digest: 'PREFIXBBBBBBBBBBBBBBBBBBBBBBBBBB', statuscode: '200', mimetype: 'text/html', length: '9100' },
+];
+
+/** Which slug each prefix capture belongs to, by timestamp. */
+export const PREFIX_ORIGINALS: ReadonlyMap<string, string> = new Map([
+  ['20250301120000', `https://${PREFIX_SLUG_A}`],
+  ['20250401120000', `https://${PREFIX_SLUG_B}`],
+]);
+
+/** F2: a retired article whose only captures are redirects to its successor. */
+export const REDIRECT_ONLY_URL = 'support.example.org/en/articles/8325612-retired';
+
+export const REDIRECT_ONLY_CAPTURES: readonly FixtureCapture[] = [
+  { timestamp: '20251022120000', digest: 'RED1RED1RED1RED1RED1RED1RED1RED1', statuscode: '301', mimetype: 'text/html', length: '512' },
+  { timestamp: '20260131120000', digest: 'RED2RED2RED2RED2RED2RED2RED2RED2', statuscode: '301', mimetype: 'text/html', length: '515' },
+];
+
+/** F2: a URL with a mix of 200s and redirects, so exclusions must be reported. */
+export const MIXED_STATUS_URL = 'example.org/pricing';
+
+function buildMixedStatus(): FixtureCapture[] {
+  const rows: FixtureCapture[] = [];
+  // 2023: redirects only. 2024-2025: readable captures.
+  for (let index = 0; index < 12; index += 1) {
+    rows.push({
+      timestamp: `2023${String(index + 1).padStart(2, '0')}15120000`,
+      digest: `MIXEDREDIRECT${String(index).padStart(19, '0')}`,
+      statuscode: '302',
+      mimetype: 'text/html',
+      length: '480',
+    });
+  }
+  for (let index = 0; index < 8; index += 1) {
+    rows.push({
+      timestamp: `2024${String(index + 1).padStart(2, '0')}15120000`,
+      digest: `MIXEDOK${String(index).padStart(25, '0')}`,
+      statuscode: '200',
+      mimetype: 'text/html',
+      length: '11000',
+    });
+  }
+  return rows;
+}
+
+export const MIXED_STATUS_CAPTURES: readonly FixtureCapture[] = buildMixedStatus();
+
+/**
+ * F3: captures with a wide gap, so requesting a date inside the gap resolves to a
+ * capture ~23 days away and must say so.
+ */
+export const GAP_URL = 'support.example.org/en/articles/gap-article';
+
+export const GAP_CAPTURES: readonly FixtureCapture[] = [
+  { timestamp: '20240921110324', digest: 'GAPAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', statuscode: '200', mimetype: 'text/html', length: '14651' },
+  { timestamp: '20241112035820', digest: 'GAPBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', statuscode: '200', mimetype: 'text/html', length: '14726' },
+];
+
+/**
+ * F4: an Intercom-style page whose CDX digest changes on every capture because of
+ * an embedded per-request nonce, while the readable text changes only twice.
+ *
+ * The three text eras bracket April 2024, mirroring the real two-stage edit to the
+ * Claude Pro message allowance.
+ */
+export const NONCE_URL = 'support.example.org/en/articles/8325612-usage-limits';
+
+export interface NonceEra {
+  readonly from: string;
+  readonly sentence: string;
+}
+
+export const NONCE_ERAS: readonly NonceEra[] = [
+  { from: '20231001000000', sentence: 'Pro subscribers can send at least 100 messages every 8 hours, and we will warn you at 20 remaining.' },
+  { from: '20240401000000', sentence: 'Pro subscribers can send at least 100 messages every 5 hours, and we will warn you at 10 remaining.' },
+  { from: '20240420000000', sentence: 'Pro subscribers can send at least 45 messages every 5 hours, and we will warn you at 7 remaining.' },
+];
+
+function eraFor(timestamp: string): NonceEra {
+  let chosen = NONCE_ERAS[0];
+  for (const era of NONCE_ERAS) {
+    if (timestamp >= era.from) chosen = era;
+  }
+  if (chosen === undefined) throw new Error('fixture eras missing');
+  return chosen;
+}
+
+/** The capture body: stable readable text, plus a nonce that changes every time. */
+export function noncePageHtml(timestamp: string): string {
+  const era = eraFor(timestamp);
+  return `<!doctype html>
+<html lang="en">
+<head><title>What are the usage limits? | Example Help Center</title>
+<meta name="csrf-token" content="nonce-${timestamp}-${String(Number(timestamp) * 7919 % 1000003)}">
+</head>
+<body>
+${chrome()}
+<main><article class="article-body">
+  <h1>What are the usage limits?</h1>
+  <p>${era.sentence}</p>
+  <p>Limits reset on a rolling window.</p>
+</article></main>
+${footer()}
+<script>window.__NEXT_DATA__={buildId:"build-${timestamp}"};</script>
+</body></html>`;
+}
+
+/** 88 captures, every one with a distinct CDX digest, across three text eras. */
+function buildNonceCaptures(): FixtureCapture[] {
+  const rows: FixtureCapture[] = [];
+  const start = Date.parse('2023-10-01T00:00:00Z');
+  const end = Date.parse('2025-07-01T00:00:00Z');
+  const total = 88;
+  const step = (end - start) / (total - 1);
+  for (let index = 0; index < total; index += 1) {
+    const timestamp = stamp(new Date(start + step * index));
+    rows.push({
+      timestamp,
+      // Distinct on every capture — this is exactly what defeats digest collapsing.
+      digest: `NONCE${timestamp}${String(index).padStart(9, '0')}`,
+      statuscode: '200',
+      mimetype: 'text/html',
+      length: String(14_000 + index),
+    });
+  }
+  return rows;
+}
+
+export const NONCE_CAPTURES: readonly FixtureCapture[] = buildNonceCaptures();
+
+/** The two real captures the fix spec says must hash identically (F4). */
+export const IDENTICAL_TEXT_PAIR: readonly [string, string] = ['20240308095154', '20240323002232'];

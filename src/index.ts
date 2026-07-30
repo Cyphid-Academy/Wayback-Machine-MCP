@@ -18,6 +18,7 @@ import { createLogger, type Logger } from './lib/log.js';
 import { buildDiff } from './lib/diff.js';
 import type { Failure } from './lib/errors.js';
 import { fetchCapture, fetchCaptureText, resolveTimestamp } from './lib/wayback.js';
+import { isEphemeralHost, type ResourceBase } from './lib/resources.js';
 
 export interface Runtime {
   readonly config: Config;
@@ -71,9 +72,26 @@ export function createRuntime(config: Config): Runtime {
   return { config, cache, limiter, upstream, logger, tools: buildToolRegistry(config), auth: buildAuthProvider(config) };
 }
 
-function toolContext(runtime: Runtime): ToolContext {
+/**
+ * F5: resource links are built from the host that was actually called, so a link
+ * emitted by the deployment points at the deployment and one emitted by the dev
+ * workspace points there. `DEPLOY_URL` is only the fallback.
+ */
+function resolveResourceBase(runtime: Runtime, req: Request | undefined): ResourceBase {
+  const host = req === undefined ? undefined : header(req, 'host');
+  if (host === undefined || host.length === 0) {
+    return { baseUrl: runtime.config.deployUrl, pathSecret: runtime.config.pathSecret };
+  }
+  const forwarded = req === undefined ? undefined : header(req, 'x-forwarded-proto');
+  const proto = (forwarded ?? '').split(',')[0]?.trim() ?? '';
+  const scheme = proto.length > 0 ? proto : host.startsWith('localhost') || host.startsWith('127.0.0.1') ? 'http' : 'https';
+  return { baseUrl: `${scheme}://${host}`, pathSecret: runtime.config.pathSecret };
+}
+
+function toolContext(runtime: Runtime, req?: Request): ToolContext {
   return {
     config: runtime.config,
+    resourceBase: resolveResourceBase(runtime, req),
     cache: runtime.cache,
     limiter: runtime.limiter,
     upstream: runtime.upstream,
@@ -159,7 +177,7 @@ async function handleSnapshotResource(runtime: Runtime, req: Request, res: Respo
   }
 
   if (format === 'raw') {
-    const capture = await fetchCapture(deps, target, resolved.value);
+    const capture = await fetchCapture(deps, target, resolved.value.timestamp);
     if (!capture.ok) {
       sendFailure(res, capture.failure);
       return;
@@ -176,7 +194,7 @@ async function handleSnapshotResource(runtime: Runtime, req: Request, res: Respo
     return;
   }
 
-  const capture = await fetchCaptureText(deps, target, resolved.value, format);
+  const capture = await fetchCaptureText(deps, target, resolved.value.timestamp, format);
   if (!capture.ok) {
     sendFailure(res, capture.failure);
     return;
@@ -215,8 +233,8 @@ async function handleDiffResource(runtime: Runtime, req: Request, res: Response,
   }
 
   const [captureA, captureB] = await Promise.all([
-    fetchCaptureText(deps, target, resolvedA.value, 'text'),
-    fetchCaptureText(deps, target, resolvedB.value, 'text'),
+    fetchCaptureText(deps, target, resolvedA.value.timestamp, 'text'),
+    fetchCaptureText(deps, target, resolvedB.value.timestamp, 'text'),
   ]);
   if (!captureA.ok) {
     sendFailure(res, captureA.failure);
@@ -303,7 +321,7 @@ export function createApp(runtime: Runtime): Express {
 
     // Stateless: a fresh server and transport per request, so no session is ever
     // pinned to an instance that Autoscale may have scaled away.
-    const server = createMcpServer(toolContext(runtime), runtime.tools);
+    const server = createMcpServer(toolContext(runtime, req), runtime.tools);
     // Stateless mode: no sessionIdGenerator. The SDK reads
     // `options?.sessionIdGenerator`, so omitting it and passing `undefined` are
     // the same thing — a session pinned to an instance Autoscale has scaled away
@@ -383,6 +401,11 @@ async function main(): Promise<void> {
   const app = createApp(runtime);
 
   for (const warning of config.warnings) runtime.logger.warn(warning);
+  if (isEphemeralHost(config.deployUrl)) {
+    runtime.logger.warn(
+      'Resource links will point at the dev workspace domain and will break when it sleeps. Deploy to Autoscale and the Host header will resolve correctly.',
+    );
+  }
 
   const server = app.listen(config.port, config.host, () => {
     runtime.logger.info('listening', { host: config.host, port: config.port, tools: runtime.tools.length });

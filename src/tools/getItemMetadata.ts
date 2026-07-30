@@ -131,9 +131,9 @@ export const getItemMetadataTool: ToolModule = defineTool<Input, Output>({
             uri: metadataUrl,
             name: `${identifier} metadata`,
             title: `Complete metadata JSON for ${identifier}`,
-            description: `Full archive.org metadata and file listing (${count(allFiles.length)} files, ${bytes(response.body.length)} of JSON).`,
+            description: `Full archive.org metadata and file listing (${count(allFiles.length)} files, ${bytes(response.byteLength)} of JSON).`,
             mimeType: 'application/json',
-            size: response.body.length,
+            size: response.byteLength,
           }),
         ]
       : [];

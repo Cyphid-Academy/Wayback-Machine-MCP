@@ -1,10 +1,18 @@
 import { z } from 'zod';
 import { compareSnapshotsInput, compareSnapshotsOutput } from '../schemas.js';
-import { fetchCaptureText, resolveTimestamp } from '../lib/wayback.js';
+import {
+  fetchCaptureText,
+  nearestAlternatives,
+  offsetNotice,
+  resolveTimestamp,
+  type ResolvedTimestamp,
+  type WaybackDeps,
+} from '../lib/wayback.js';
 import { normalizeTargetUrl, waybackVisualDiffUrl } from '../lib/urls.js';
 import { timestampToIso } from '../lib/timestamps.js';
-import { DIFF_INLINE_CAP, buildDiff, capText } from '../lib/diff.js';
-import { diffResourceUri, resourceLink, type ResourceLinkBlock } from '../lib/resources.js';
+import { buildDiff, capText } from '../lib/diff.js';
+import { diffResourceUri, resourceLink, truncationNotice, type ResourceLinkBlock } from '../lib/resources.js';
+import { failure, type Failure } from '../lib/errors.js';
 import { defineTool, fail, succeed, type ToolModule } from './define.js';
 import { count, shortDateTime, summary } from './format.js';
 
@@ -15,7 +23,7 @@ export const compareSnapshotsTool: ToolModule = defineTool<Input, Output>({
   name: 'compare_snapshots',
   title: 'Diff two archived captures',
   description:
-    'Diffs two captures of the same URL and returns what changed: added/removed character counts, how many sections changed, and a unified diff of the extracted text (capped at 15,000 characters, with a resource link to the full diff if it is longer). Both captures are fetched with the id_ modifier and stripped of navigation chrome first, so the diff shows content changes rather than banner and language-switcher noise. timestampA/timestampB default to the earliest and latest captures and accept "earliest"/"latest" or any date. Pass firstSeen values from list_revisions to diff two specific revisions. If the result says identical, both timestamps resolved to the same capture — pick timestamps from different revisions.',
+    'Diffs two captures of the same URL and returns what changed: added/removed character counts, how many sections changed, and a unified diff of the extracted text (capped at 15,000 characters by default — raise maxChars to see a long diff in full). Both captures are fetched with the id_ modifier and stripped of navigation chrome first, so the diff shows content changes rather than banner and language-switcher noise. timestampA/timestampB default to the earliest and latest captures and accept "earliest"/"latest" or any date; when a date resolves to a capture some days away, the result says so for each endpoint, so a change is never dated to the wrong day. Pass firstSeen values from list_revisions to diff two specific revisions. If the result says identical, both timestamps resolved to the same capture.',
   annotations: { title: 'Diff two archived captures', readOnlyHint: true, openWorldHint: true },
   input: compareSnapshotsInput,
   output: compareSnapshotsOutput,
@@ -33,11 +41,18 @@ export const compareSnapshotsTool: ToolModule = defineTool<Input, Output>({
     if (!resolvedB.ok) return fail(resolvedB.failure);
 
     const [captureA, captureB] = await Promise.all([
-      fetchCaptureText(deps, url, resolvedA.value, 'text'),
-      fetchCaptureText(deps, url, resolvedB.value, 'text'),
+      fetchCaptureText(deps, url, resolvedA.value.timestamp, 'text'),
+      fetchCaptureText(deps, url, resolvedB.value.timestamp, 'text'),
     ]);
-    if (!captureA.ok) return fail(captureA.failure);
-    if (!captureB.ok) return fail(captureB.failure);
+
+    // F7: one unfetchable capture should not dead-end the comparison. Name the
+    // endpoint that failed and hand back timestamps the caller can retry with.
+    if (!captureA.ok) {
+      return fail(await endpointFailure(deps, url, 'A', resolvedA.value.timestamp, resolvedB.value.timestamp, captureA.failure));
+    }
+    if (!captureB.ok) {
+      return fail(await endpointFailure(deps, url, 'B', resolvedB.value.timestamp, resolvedA.value.timestamp, captureB.failure));
+    }
 
     const timestampA = captureA.value.timestamp;
     const timestampB = captureB.value.timestamp;
@@ -46,8 +61,9 @@ export const compareSnapshotsTool: ToolModule = defineTool<Input, Output>({
       labelA: `${url} @ ${timestampA}`,
       labelB: `${url} @ ${timestampB}`,
     });
-    const capped = capText(diff.unified, DIFF_INLINE_CAP);
-    const uri = capped.truncated ? diffResourceUri(ctx.config, timestampA, timestampB, url, input.granularity) : null;
+    const capped = capText(diff.unified, input.maxChars);
+    const uri = capped.truncated ? diffResourceUri(ctx.resourceBase, timestampA, timestampB, url, input.granularity) : null;
+    const artifactBytes = Buffer.byteLength(diff.unified, 'utf8');
 
     const structured: Output = {
       url,
@@ -56,6 +72,10 @@ export const compareSnapshotsTool: ToolModule = defineTool<Input, Output>({
       timestampAIso: timestampToIso(timestampA),
       timestampBIso: timestampToIso(timestampB),
       granularity: input.granularity,
+      requestedTimestampA: resolvedA.value.requested,
+      requestedTimestampB: resolvedB.value.requested,
+      offsetDaysA: resolvedA.value.offsetDays,
+      offsetDaysB: resolvedB.value.offsetDays,
       identical: diff.identical,
       addedChars: diff.addedChars,
       removedChars: diff.removedChars,
@@ -65,6 +85,9 @@ export const compareSnapshotsTool: ToolModule = defineTool<Input, Output>({
       charsA: captureA.value.text.length,
       charsB: captureB.value.text.length,
       diffTotalChars: diff.totalChars,
+      artifactBytes,
+      inlinedChars: capped.text.length,
+      maxChars: input.maxChars,
       truncated: capped.truncated,
       resourceUri: uri,
       visualDiffUrl: waybackVisualDiffUrl(ctx.config.webArchiveBase, timestampA, timestampB, url),
@@ -80,15 +103,19 @@ export const compareSnapshotsTool: ToolModule = defineTool<Input, Output>({
           title: `Full ${input.granularity} diff of ${url}`,
           description: `Complete unified diff between the ${shortDateTime(timestampA)} and ${shortDateTime(timestampB)} captures, ${count(diff.totalChars)} characters.`,
           mimeType: 'text/plain',
-          size: diff.totalChars,
+          size: artifactBytes,
         }),
       );
     }
 
+    const notices = [offsetNotice(resolvedA.value), offsetNotice(resolvedB.value)].filter(
+      (line): line is string => line !== undefined,
+    );
     const header = [
+      ...(notices.length === 0 ? [] : [...notices, '']),
       `${url}`,
-      `A: ${timestampA} (${shortDateTime(timestampA)}), ${count(structured.charsA)} chars`,
-      `B: ${timestampB} (${shortDateTime(timestampB)}), ${count(structured.charsB)} chars`,
+      endpointLine('A', resolvedA.value, timestampA, structured.charsA),
+      endpointLine('B', resolvedB.value, timestampB, structured.charsB),
       `Visual diff: ${structured.visualDiffUrl}`,
     ];
 
@@ -112,7 +139,7 @@ export const compareSnapshotsTool: ToolModule = defineTool<Input, Output>({
           ...header,
           '',
           'The extracted text of these two captures is identical — the page did not change between them (only chrome or markup may have).',
-          'Next: list_revisions groups captures by content digest and will show which captures differ.',
+          'Next: list_revisions groups captures by content and will show which captures differ.',
         ]),
         links,
       );
@@ -126,7 +153,7 @@ export const compareSnapshotsTool: ToolModule = defineTool<Input, Output>({
           '',
           `The diff algorithm timed out on these two captures (${count(structured.charsA)} vs ${count(structured.charsB)} characters).`,
           `Approximate change: ${count(diff.addedChars)} characters added, ${count(diff.removedChars)} removed.`,
-          'Next: retry with granularity="line", or compare two captures that are closer together in time.',
+          'Next: retry with granularity="line", or compare two captures closer together in time.',
         ]),
         links,
       );
@@ -141,15 +168,41 @@ export const compareSnapshotsTool: ToolModule = defineTool<Input, Output>({
       [
         ...header,
         stats,
-        capped.truncated
-          ? `Diff capped at ${count(DIFF_INLINE_CAP)} of ${count(capped.totalChars)} characters; the full diff is behind the resource link below.`
-          : '',
         '',
         capped.text,
+        ...(capped.truncated ? ['', truncationNotice(capped.text.length, capped.totalChars)] : []),
       ]
-        .filter((line) => line.length > 0)
+        .filter((line, index, all) => line.length > 0 || (index > 0 && all[index - 1]?.length !== 0))
         .join('\n'),
       links,
     );
   },
 });
+
+/**
+ * Turns one endpoint's fetch failure into an actionable error: which endpoint,
+ * that the other one was fine (so it is not a connectivity problem), and the
+ * three nearest captures to retry with (F7).
+ */
+async function endpointFailure(
+  deps: WaybackDeps,
+  url: string,
+  label: string,
+  badTimestamp: string,
+  goodTimestamp: string,
+  original: Failure,
+): Promise<Failure> {
+  const alternatives = await nearestAlternatives(deps, url, badTimestamp, [goodTimestamp]);
+  return failure(original.code, `Capture ${badTimestamp} (endpoint ${label}) could not be retrieved: ${original.message}`, {
+    hint:
+      alternatives.length === 0
+        ? 'Run search_snapshots to pick another timestamp for that endpoint.'
+        : `Nearest usable alternatives: ${alternatives.join(', ')}. The other endpoint (${goodTimestamp}) fetched fine, so this is that one capture rather than a connectivity problem.`,
+  });
+}
+
+function endpointLine(label: string, resolved: ResolvedTimestamp, actual: string, chars: number): string {
+  const requestedDiffers = resolved.offsetDays !== null && resolved.requested.slice(0, 8) !== actual.slice(0, 8);
+  const requested = requestedDiffers ? ` (requested ${resolved.requested.slice(0, 8)})` : '';
+  return `${label}: ${actual} (${shortDateTime(actual)})${requested}, ${count(chars)} chars`;
+}

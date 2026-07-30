@@ -12,12 +12,14 @@ type Output = z.infer<typeof searchSnapshotsOutput>;
 type Row = z.infer<typeof searchSnapshotsOutput>['rows'][number];
 
 const TEXT_ROWS = 12;
+/** Cap on the distinct-URL list in both channels (F1). */
+const MAX_DISTINCT_URLS = 50;
 
 export const searchSnapshotsTool: ToolModule = defineTool<Input, Output>({
   name: 'search_snapshots',
   title: 'Search the capture index',
   description:
-    'Queries the Wayback CDX index and returns capture rows as structured data (timestamp, status, mime type, content digest, size) — never raw index text and never page content. This is the general-purpose enumeration tool: use it to see what exists, to page through large capture sets, or to find URLs under a host with matchType "prefix"/"host"/"domain". For the specific job of "how many times did this page actually change?", prefer list_revisions, which collapses captures by content digest. Run archive_stats first on an unfamiliar URL so you can set from/to and avoid pulling thousands of rows.',
+    'Queries the Wayback CDX index and returns capture rows as structured data — timestamp, the matched URL, status, mime type, content digest and size — never raw index text and never page content. With matchType "prefix", "host" or "domain" every row names the URL it is a capture of, which is how you discover the real slug of a page you only half know. This is the general-purpose enumeration tool: use it to see what exists, to page through large capture sets, or to find URLs under a host. For "how many times did this page actually change?", prefer list_revisions. Run archive_stats first on an unfamiliar URL so you can set from/to and avoid pulling thousands of rows.',
   annotations: { title: 'Search the capture index', readOnlyHint: true, openWorldHint: true },
   input: searchSnapshotsInput,
   output: searchSnapshotsOutput,
@@ -74,10 +76,14 @@ export const searchSnapshotsTool: ToolModule = defineTool<Input, Output>({
       snapshotUrl: waybackCaptureUrl(ctx.config.webArchiveBase, row.timestamp, row.original.length > 0 ? row.original : url),
     }));
 
+    const distinctUrls = [...new Set(rows.map((row) => row.original).filter((original) => original.length > 0))];
+
     const structured: Output = {
       url,
       matchType: input.matchType,
       rows,
+      distinctUrls: distinctUrls.slice(0, MAX_DISTINCT_URLS),
+      distinctUrlCount: distinctUrls.length,
       totalReturned: rows.length,
       hasMore,
       rowsTruncated,
@@ -94,12 +100,31 @@ export const searchSnapshotsTool: ToolModule = defineTool<Input, Output>({
       );
     }
 
+    // With a non-exact match type the matched URL is the whole point, so it goes
+    // on every row; with `exact` it is redundant and appears once in the header (F1).
+    const perRowUrl = input.matchType !== 'exact';
     const lines = [
       `${count(rows.length)} capture${rows.length === 1 ? '' : 's'} of ${url} (matchType ${input.matchType})`,
       `Range: ${shortDateTime(rows[0]?.timestamp ?? '')} → ${shortDateTime(rows[rows.length - 1]?.timestamp ?? '')}`,
-      '',
-      ...rows.slice(0, TEXT_ROWS).map((row) => `${row.timestamp}  ${row.statuscode.padEnd(3)}  ${row.mimetype.padEnd(24).slice(0, 24)}  ${row.digest.slice(0, 12)}`),
     ];
+    if (perRowUrl && distinctUrls.length > 1) {
+      lines.push('', `${count(distinctUrls.length)} distinct URLs matched:`);
+      for (const original of distinctUrls.slice(0, MAX_DISTINCT_URLS)) lines.push(`  ${original}`);
+      if (distinctUrls.length > MAX_DISTINCT_URLS) {
+        lines.push(`  … ${count(distinctUrls.length - MAX_DISTINCT_URLS)} more distinct URLs`);
+      }
+    }
+    lines.push(
+      '',
+      ...rows
+        .slice(0, TEXT_ROWS)
+        .map(
+          (row) =>
+            `${row.timestamp}  ${row.statuscode.padEnd(3)}  ${row.mimetype.padEnd(20).slice(0, 20)}  ${row.digest.slice(0, 10)}${
+              perRowUrl ? `  ${row.original}` : ''
+            }`,
+        ),
+    );
     if (rows.length > TEXT_ROWS) lines.push(`… ${count(rows.length - TEXT_ROWS)} more rows in structuredContent.`);
     if (rowsTruncated) {
       lines.push(

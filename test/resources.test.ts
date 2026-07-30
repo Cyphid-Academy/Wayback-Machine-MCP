@@ -4,13 +4,16 @@ import { loadConfig } from '../src/config.js';
 import { DIFF_INLINE_CAP } from '../src/lib/diff.js';
 import {
   INLINE_TEXT_LIMIT,
+  MAX_INLINE_CHARS,
   MAX_TABLE_ROWS,
   PREVIEW_CHARS,
   diffResourceUri,
+  isEphemeralHost,
   mimeTypeForFormat,
   resourceLink,
   snapshotResourceUri,
   textPayload,
+  truncationNotice,
 } from '../src/lib/resources.js';
 
 const config = loadConfig({
@@ -18,6 +21,8 @@ const config = loadConfig({
   MCP_PATH_SECRET: 'secret123',
   CONTACT_EMAIL: 'test@example.org',
 });
+
+const base = { baseUrl: config.deployUrl, pathSecret: config.pathSecret };
 
 describe('textPayload — the 8,000 character threshold', () => {
   it('inlines text at or below the limit', () => {
@@ -53,7 +58,7 @@ describe('textPayload — the 8,000 character threshold', () => {
 
 describe('resource URIs', () => {
   it('builds a snapshot URI under the path secret with the URL encoded', () => {
-    const uri = snapshotResourceUri(config, '20230901120000', 'support.example.org/en/articles/1?x=1', 'markdown');
+    const uri = snapshotResourceUri(base, '20230901120000', 'support.example.org/en/articles/1?x=1', 'markdown');
     assert.equal(
       uri,
       'https://wayback.example.test/r/secret123/snapshot/20230901120000/support.example.org%2Fen%2Farticles%2F1%3Fx%3D1?format=markdown',
@@ -62,15 +67,52 @@ describe('resource URIs', () => {
   });
 
   it('builds a diff URI with both timestamps and the granularity', () => {
-    const uri = diffResourceUri(config, '20230901120000', '20260101120000', 'example.com/p', 'line');
+    const uri = diffResourceUri(base, '20230901120000', '20260101120000', 'example.com/p', 'line');
     assert.equal(uri, 'https://wayback.example.test/r/secret123/diff/20230901120000/20260101120000/example.com%2Fp?granularity=line');
   });
 
   it('round-trips an encoded URL', () => {
     const original = 'https://example.com/a b/c?d=e&f=g';
-    const uri = snapshotResourceUri(config, '20230901120000', original, 'text');
+    const uri = snapshotResourceUri(base, '20230901120000', original, 'text');
     const encoded = uri.split('/snapshot/20230901120000/')[1]?.split('?')[0] ?? '';
     assert.equal(decodeURIComponent(encoded), original);
+  });
+});
+
+describe('resource base resolution (F5)', () => {
+  it('flags a Replit workspace host as ephemeral', () => {
+    assert.equal(isEphemeralHost('https://something-kirk.replit.dev'), true);
+    assert.equal(isEphemeralHost('https://wayback-machine-mcp.replit.app'), false);
+    assert.equal(isEphemeralHost('http://localhost:3000'), false);
+    assert.equal(isEphemeralHost('not a url'), false);
+  });
+
+  it('builds URIs from whatever base it is handed, not from configuration', () => {
+    const deployed = { baseUrl: 'https://wayback-machine-mcp.replit.app', pathSecret: 'sec' };
+    const uri = snapshotResourceUri(deployed, '20240101000000', 'example.com/p', 'text');
+    assert.ok(uri.startsWith('https://wayback-machine-mcp.replit.app/r/sec/snapshot/'));
+    assert.ok(!uri.includes('replit.dev'));
+  });
+});
+
+describe('textPayload escalation (F8)', () => {
+  it('inlines up to an escalated limit and reports the cut', () => {
+    const text = 'a'.repeat(20_000);
+    const payload = textPayload(text, 12_000);
+    assert.equal(payload.truncated, true);
+    assert.equal(payload.inline?.length, 12_000);
+    assert.match(truncationNotice(12_000, 20_000), /Truncated at 12,000 of 20,000 characters/);
+    assert.match(truncationNotice(12_000, 20_000), /higher maxChars/);
+  });
+
+  it('inlines nothing beyond the preview at the default limit', () => {
+    const payload = textPayload('a'.repeat(20_000));
+    assert.equal(payload.inline, undefined);
+    assert.equal(payload.preview.length, PREVIEW_CHARS);
+  });
+
+  it('caps escalation at 100,000 characters', () => {
+    assert.equal(MAX_INLINE_CHARS, 100_000);
   });
 });
 

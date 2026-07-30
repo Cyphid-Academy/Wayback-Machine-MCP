@@ -1,10 +1,23 @@
 import assert from 'node:assert/strict';
-import type { Server } from 'node:http';
+import { request as httpRequest, type Server } from 'node:http';
 import { after, before, describe, it } from 'node:test';
 import { loadConfig } from '../src/config.js';
 import { createApp, createRuntime, type Runtime } from '../src/index.js';
 import { startFixtureUpstream, type FixtureUpstream } from './fixtures/upstream.js';
-import { TARGET_URL, VARIANTS } from './fixtures/pages.js';
+import {
+  GAP_URL,
+  IDENTICAL_TEXT_PAIR,
+  MIXED_STATUS_URL,
+  NONCE_URL,
+  PREFIX_STEM,
+  REDIRECT_ONLY_URL,
+  TARGET_URL,
+  VARIANTS,
+  noncePageHtml,
+} from './fixtures/pages.js';
+import { extractText } from '../src/lib/extract.js';
+import { evenlySpaced, textDigest } from '../src/lib/wayback.js';
+import { isEphemeralHost } from '../src/lib/resources.js';
 
 const SECRET = 'integration-path-secret';
 const DEPLOY_URL = 'https://wayback.example.test';
@@ -112,6 +125,50 @@ async function rpc(method: string, params?: Record<string, unknown>, options: { 
     if (typeof parsed === 'object' && parsed !== null) body = parsed;
   }
   return { status: response.status, body };
+}
+
+/**
+ * A JSON-RPC POST over raw http, so a test can set headers that `fetch` forbids —
+ * notably Host, which F5's resource-URI derivation reads.
+ */
+async function rawRpc(params: Record<string, unknown>, headers: Record<string, string>): Promise<JsonRpcEnvelope> {
+  requestId += 1;
+  const payload = JSON.stringify({ jsonrpc: '2.0', id: requestId, method: 'tools/call', params });
+  const address = httpServer.address();
+  if (address === null || typeof address === 'string') throw new Error('server not bound');
+  return new Promise<JsonRpcEnvelope>((resolve, reject) => {
+    const request = httpRequest(
+      {
+        hostname: '127.0.0.1',
+        port: address.port,
+        path: `/mcp/${SECRET}`,
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          'content-length': String(Buffer.byteLength(payload)),
+          ...headers,
+        },
+      },
+      (response) => {
+        let text = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk: string) => {
+          text += chunk;
+        });
+        response.on('end', () => {
+          try {
+            const parsed: unknown = JSON.parse(text);
+            resolve(typeof parsed === 'object' && parsed !== null ? Object.fromEntries(Object.entries(parsed)) : {});
+          } catch (error) {
+            reject(error instanceof Error ? error : new Error(String(error)));
+          }
+        });
+      },
+    );
+    request.on('error', reject);
+    request.end(payload);
+  });
 }
 
 function resultObject(envelope: JsonRpcEnvelope): Record<string, unknown> {
@@ -365,11 +422,23 @@ describe('tools/list', () => {
 });
 
 describe('archive_stats', () => {
-  it('summarises coverage from the sparkline endpoint', async () => {
+  it('summarises coverage with a status-class breakdown (F2)', async () => {
     const result = await callTool('archive_stats', { url: TARGET_URL });
     assert.notEqual(result.isError, true, textOf(result));
-    assert.equal(str(result.structuredContent, 'source'), 'sparkline');
+    assert.equal(str(result.structuredContent, 'source'), 'cdx', 'CDX is the only source that can report statuses');
     assert.ok(num(result.structuredContent, 'totalCaptures') > 250);
+    const breakdown = result.structuredContent?.['byStatusClass'];
+    assert.ok(typeof breakdown === 'object' && breakdown !== null);
+    const classes = Object.fromEntries(Object.entries(breakdown));
+    assert.ok(Number(classes['ok']) > 250, 'most fixture captures are 200s');
+    assert.equal(Number(classes['redirects']), 1, 'the fixture has exactly one redirect');
+    assert.equal(
+      Number(classes['ok']) + Number(classes['redirects']) + Number(classes['clientErrors']) + Number(classes['serverErrors']) + Number(classes['other']),
+      Number(classes['total']),
+      'the classes must sum to the total',
+    );
+    assert.match(textOf(result), /200: /);
+    assert.match(textOf(result), /Content captures \(200 only\)/);
     assert.match(str(result.structuredContent, 'firstCapture'), /^20230912/);
     const byYear = result.structuredContent?.['byYear'];
     assert.ok(typeof byYear === 'object' && byYear !== null);
@@ -588,7 +657,9 @@ describe('get_snapshot', () => {
     const links = linksOf(result);
     assert.equal(links.length, 1);
     const link = links[0];
-    assert.ok((link?.uri ?? '').startsWith(`${DEPLOY_URL}/r/${SECRET}/snapshot/`), `unexpected uri ${String(link?.uri)}`);
+    // F5: built from the host that was actually called, not from DEPLOY_URL.
+    assert.ok((link?.uri ?? '').startsWith(`${baseUrl}/r/${SECRET}/snapshot/`), `unexpected uri ${String(link?.uri)}`);
+    assert.ok(!(link?.uri ?? '').startsWith(DEPLOY_URL), 'the configured DEPLOY_URL must not win over the request Host');
     assert.equal(link?.mimeType, 'text/plain');
     assert.ok((link?.size ?? 0) > 8_000);
     assert.ok((link?.name ?? '').length > 0, 'a ResourceLink must carry a name');
@@ -867,8 +938,8 @@ describe('HTTP resource routes', () => {
   it('resolves the URI a get_snapshot ResourceLink actually hands out', async () => {
     const result = await callTool('get_snapshot', { url: TARGET_URL, timestamp: 'latest' });
     const uri = linksOf(result)[0]?.uri ?? '';
-    assert.ok(uri.startsWith(DEPLOY_URL));
-    const response = await fetch(uri.replace(DEPLOY_URL, baseUrl));
+    assert.ok(uri.startsWith(baseUrl), `link should point at the calling host, got ${uri}`);
+    const response = await fetch(uri);
     assert.equal(response.status, 200, 'the advertised resource link must resolve');
     const text = await response.text();
     assert.equal(text.length, num(result.structuredContent, 'totalChars'), 'the link serves the full text');
@@ -952,10 +1023,349 @@ describe('upstream discipline', () => {
 
   it('surfaces an upstream 503 as a structured tool error after retries', async () => {
     await callTool('clear_cache');
-    fixture.failNext(9, 503, 1);
+    // Exactly one call's worth of attempts, so no injected failures leak into
+    // whichever test runs next.
+    fixture.failNext(4, 503, 1);
     const result = await callTool('search_snapshots', { url: TARGET_URL, limit: 3 });
     assert.equal(result.isError, true);
     assert.match(textOf(result), /rate_limited|upstream_error/);
     assert.ok(!textOf(result).includes('    at '));
+    fixture.failNext(0, 503);
+    await callTool('clear_cache');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regressions for the defects found in first live use (waybackmcpFIXES.md).
+// ---------------------------------------------------------------------------
+
+describe('F1 — prefix search names the URL each capture belongs to', () => {
+  it('carries `original` on every row in structuredContent', async () => {
+    const result = await callTool('search_snapshots', {
+      url: PREFIX_STEM,
+      matchType: 'prefix',
+      filter: ['statuscode:200'],
+      collapse: 'timestamp:6',
+    });
+    assert.notEqual(result.isError, true, textOf(result));
+    const rows = result.structuredContent?.['rows'];
+    assert.ok(Array.isArray(rows) && rows.length >= 2, 'the reproduction returns two capture rows');
+    for (const entry of rows) {
+      const row = asRecord(entry);
+      assert.ok(row !== undefined);
+      const original = asString(row['original']);
+      assert.ok(original !== undefined && original.length > 0, 'every row must name its URL');
+      assert.match(original, /11647753-what-are-usage-limits/, 'the real slug, not the queried stem');
+    }
+  });
+
+  it('prints the matched URL on every row of the text summary', async () => {
+    const text = textOf(
+      await callTool('search_snapshots', { url: PREFIX_STEM, matchType: 'prefix', filter: ['statuscode:200'] }),
+    );
+    assert.match(text, /11647753-what-are-usage-limits/, 'the slug must be visible without reading structuredContent');
+  });
+
+  it('lists the distinct URLs when a prefix match spans several', async () => {
+    const result = await callTool('search_snapshots', { url: PREFIX_STEM, matchType: 'prefix', limit: 100 });
+    assert.equal(num(result.structuredContent, 'distinctUrlCount'), 2);
+    const distinct = result.structuredContent?.['distinctUrls'];
+    assert.ok(Array.isArray(distinct) && distinct.length === 2);
+    assert.match(textOf(result), /2 distinct URLs matched/);
+  });
+
+  it('omits the redundant per-row URL for an exact match', async () => {
+    const text = textOf(await callTool('search_snapshots', { url: TARGET_URL, limit: 3 }));
+    const rowLines = text.split('\n').filter((line) => /^\d{14}\s/.test(line));
+    assert.ok(rowLines.length > 0);
+    for (const line of rowLines) assert.ok(!line.includes(TARGET_URL), 'exact match prints the URL once in the header');
+  });
+
+  it('builds snapshotUrl from the row’s own URL, not the query', async () => {
+    const result = await callTool('search_snapshots', { url: PREFIX_STEM, matchType: 'prefix', limit: 100 });
+    const rows = result.structuredContent?.['rows'];
+    assert.ok(Array.isArray(rows));
+    for (const entry of rows) {
+      const row = asRecord(entry);
+      const original = asString(row?.['original']) ?? '';
+      const snapshotUrl = asString(row?.['snapshotUrl']) ?? '';
+      assert.ok(snapshotUrl.endsWith(original), `snapshotUrl ${snapshotUrl} should end with ${original}`);
+    }
+  });
+
+  it('lets get_snapshot succeed on the discovered slug without guesswork', async () => {
+    const search = await callTool('search_snapshots', { url: PREFIX_STEM, matchType: 'prefix', limit: 1 });
+    const rows = search.structuredContent?.['rows'];
+    assert.ok(Array.isArray(rows));
+    const slug = asString(asRecord(rows[0])?.['original']) ?? '';
+    const snapshot = await callTool('get_snapshot', { url: slug, timestamp: 'earliest' });
+    assert.notEqual(snapshot.isError, true, textOf(snapshot));
+  });
+});
+
+describe('F2 — capture counts never contradict each other', () => {
+  it('explains an all-redirects URL instead of denying its captures exist', async () => {
+    const stats = await callTool('archive_stats', { url: REDIRECT_ONLY_URL });
+    assert.notEqual(stats.isError, true);
+    assert.equal(num(stats.structuredContent, 'totalCaptures'), 2);
+    const breakdown = asRecord(stats.structuredContent?.['byStatusClass']);
+    assert.equal(Number(breakdown?.['redirects']), 2);
+    assert.equal(Number(breakdown?.['ok']), 0);
+    assert.equal(stats.structuredContent?.['contentFirstCapture'], null);
+    assert.match(textOf(stats), /A large share of captures are redirects/);
+
+    const compare = await callTool('compare_snapshots', { url: REDIRECT_ONLY_URL, timestampA: 'earliest', timestampB: 'latest' });
+    assert.equal(compare.isError, true);
+    const text = textOf(compare);
+    assert.match(text, /2 captures exist/, 'must acknowledge the captures');
+    assert.match(text, /none returned HTTP 200/);
+    assert.match(text, /3xx: 2/);
+    assert.match(text, /likely moved/);
+    assert.ok(!/has no usable captures/.test(text), 'must not claim nothing is archived');
+  });
+
+  it('reports how many captures list_revisions excluded and why', async () => {
+    const stats = await callTool('archive_stats', { url: MIXED_STATUS_URL });
+    const total = num(stats.structuredContent, 'totalCaptures');
+    const revisions = await callTool('list_revisions', { url: MIXED_STATUS_URL });
+    assert.equal(num(revisions.structuredContent, 'capturesTotal'), total, 'both tools must agree on the total');
+    assert.equal(num(revisions.structuredContent, 'capturesExcluded'), 12);
+    assert.equal(str(revisions.structuredContent, 'excludedReason'), 'not status 200');
+    assert.match(textOf(revisions), /8 of 20 captures examined \(12 excluded: not status 200\)/);
+  });
+
+  it('reports the content-only range separately from the full range', async () => {
+    const stats = await callTool('archive_stats', { url: MIXED_STATUS_URL });
+    assert.match(str(stats.structuredContent, 'firstCapture'), /^2023/);
+    assert.match(str(stats.structuredContent, 'contentFirstCapture'), /^2024/, '200s start a year later');
+  });
+});
+
+describe('F3 — an approximate timestamp never resolves silently', () => {
+  it('reports the gap in days when the nearest capture is far away', async () => {
+    const result = await callTool('get_snapshot', { url: GAP_URL, timestamp: '20241020' });
+    assert.notEqual(result.isError, true, textOf(result));
+    assert.equal(str(result.structuredContent, 'timestamp'), '20241112035820');
+    assert.equal(str(result.structuredContent, 'requestedTimestamp'), '20241020');
+    const offset = num(result.structuredContent, 'offsetDays');
+    assert.ok(offset >= 22 && offset <= 24, `expected roughly 23 days, got ${String(offset)}`);
+    const text = textOf(result);
+    assert.match(text, /^Note: nearest capture to 20241020 is 20241112035820, 23 days later\./m);
+    assert.match(text, /no captures in between/);
+  });
+
+  it('says nothing for an exact-enough resolution', async () => {
+    const result = await callTool('get_snapshot', { url: GAP_URL, timestamp: '20241112' });
+    assert.ok(!/^Note: nearest capture/m.test(textOf(result)), 'a same-day resolution needs no notice');
+    assert.ok(Math.abs(num(result.structuredContent, 'offsetDays')) <= 3);
+  });
+
+  it('treats earliest and latest as exact', async () => {
+    for (const timestamp of ['earliest', 'latest']) {
+      const result = await callTool('get_snapshot', { url: GAP_URL, timestamp });
+      assert.equal(result.structuredContent?.['offsetDays'], null, `${timestamp} is exact by definition`);
+      assert.ok(!/^Note: nearest capture/m.test(textOf(result)));
+    }
+  });
+
+  it('reports both endpoints independently in compare_snapshots', async () => {
+    const result = await callTool('compare_snapshots', { url: GAP_URL, timestampA: '20240921', timestampB: '20241101' });
+    assert.notEqual(result.isError, true, textOf(result));
+    assert.equal(str(result.structuredContent, 'timestampB'), '20241112035820');
+    assert.ok(Math.abs(num(result.structuredContent, 'offsetDaysB')) >= 10);
+    const text = textOf(result);
+    assert.match(text, /Note: nearest capture to 20241101 is 20241112035820/);
+    assert.match(text, /B: 20241112035820 .*\(requested 20241101\)/, 'the header shows requested and resolved');
+  });
+});
+
+describe('F4 — digest collapse falls back when digests are noise', () => {
+  it('reproduces the defect in digest mode: 88 captures, 88 "revisions"', async () => {
+    const result = await callTool('list_revisions', { url: NONCE_URL, method: 'digest' });
+    assert.equal(num(result.structuredContent, 'totalRevisions'), 88);
+    assert.equal(str(result.structuredContent, 'method'), 'digest');
+    assert.ok(num(result.structuredContent, 'digestRatio') >= 0.9);
+    assert.match(textOf(result), /probably embeds per-request tokens/, 'digest mode warns that the result is noise');
+  });
+
+  it('collapses the same captures to a single-digit revision count in auto mode', async () => {
+    const result = await callTool('list_revisions', { url: NONCE_URL });
+    assert.notEqual(result.isError, true, textOf(result));
+    assert.equal(str(result.structuredContent, 'method'), 'text', 'auto must detect the noise and switch');
+    const revisions = num(result.structuredContent, 'totalRevisions');
+    assert.ok(revisions < 10, `expected fewer than 10 revisions, got ${String(revisions)}`);
+    assert.ok(revisions >= 3, `expected the three text eras to survive, got ${String(revisions)}`);
+    assert.ok(num(result.structuredContent, 'capturesSampled') <= 24, 'never more than 24 fetches');
+    assert.ok(num(result.structuredContent, 'capturesSampled') > 0);
+  });
+
+  it('states the method and its precision limits', async () => {
+    const text = textOf(await callTool('list_revisions', { url: NONCE_URL }));
+    assert.match(text, /CDX digests were unusable \(88\/88 distinct/);
+    assert.match(text, /per-request tokens/);
+    assert.match(text, /text-digest mode over \d+ evenly-spaced captures/);
+    assert.match(text, /accurate to the sampling interval, not to the day/);
+    assert.match(text, /Narrow from\/to and re-run to sharpen a boundary/);
+  });
+
+  it('brackets the April 2024 boundary', async () => {
+    const result = await callTool('list_revisions', { url: NONCE_URL });
+    const revisions = result.structuredContent?.['revisions'];
+    assert.ok(Array.isArray(revisions));
+    const boundaries = revisions
+      .map((entry) => asString(asRecord(entry)?.['firstSeen']) ?? '')
+      .filter((stamp) => stamp.length === 14);
+    const bracketsApril = boundaries.some((stamp) => stamp >= '20240301000000' && stamp <= '20240701000000');
+    assert.ok(bracketsApril, `expected a revision boundary near April 2024, got ${boundaries.join(', ')}`);
+  });
+
+  it('hashes two captures with identical body text identically', async () => {
+    const [first, second] = IDENTICAL_TEXT_PAIR;
+    // Same era, so the readable text matches while the nonce and build id differ.
+    const a = extractText(noncePageHtml(first)).text;
+    const b = extractText(noncePageHtml(second)).text;
+    assert.equal(a, b, 'the fixture bodies must have identical readable text');
+    assert.equal(textDigest(a), textDigest(b));
+    assert.notEqual(noncePageHtml(first), noncePageHtml(second), 'the raw bytes differ, which is the whole problem');
+  });
+
+  it('ignores case and whitespace when hashing text', () => {
+    assert.equal(textDigest('Hello   World'), textDigest('hello world'));
+    assert.notEqual(textDigest('hello world'), textDigest('hello worlds'));
+  });
+
+  it('samples evenly across the range', () => {
+    const items = Array.from({ length: 100 }, (_unused, index) => index);
+    const picked = evenlySpaced(items, 5);
+    assert.deepEqual(picked, [0, 25, 50, 74, 99], 'step is 24.75, so index 3 rounds to 74');
+    assert.deepEqual(evenlySpaced([1, 2], 5), [1, 2], 'fewer items than the limit returns them all');
+    assert.deepEqual(evenlySpaced(items, 0), []);
+  });
+});
+
+describe('F5 — resource URIs follow the calling host', () => {
+  it('builds an https URI for the deployment host behind a proxy', async () => {
+    // Raw http, not fetch: fetch treats Host as a forbidden header and overwrites
+    // it, so a proxied request can only be simulated at this level.
+    const body = await rawRpc(
+      { name: 'get_snapshot', arguments: { url: TARGET_URL, timestamp: 'latest' } },
+      { host: 'wayback-machine-mcp.replit.app', 'x-forwarded-proto': 'https' },
+    );
+    const result = resultObject(body);
+    const content = result['content'];
+    assert.ok(Array.isArray(content));
+    const link = contentBlocks(content).find((block) => block.type === 'resource_link');
+    assert.ok(link !== undefined, 'a long page should carry a resource link');
+    assert.ok(
+      (link.uri ?? '').startsWith('https://wayback-machine-mcp.replit.app/r/'),
+      `expected the deployment host, got ${String(link.uri)}`,
+    );
+    assert.ok(!(link.uri ?? '').includes('replit.dev'), 'never the dev workspace domain');
+    assert.ok(!(link.uri ?? '').includes('wayback.example.test'), 'never the configured DEPLOY_URL');
+  });
+
+  it('keeps http for a plain local call', async () => {
+    const body = await rawRpc({ name: 'get_snapshot', arguments: { url: TARGET_URL, timestamp: 'latest' } }, {});
+    const content = resultObject(body)['content'];
+    assert.ok(Array.isArray(content));
+    const link = contentBlocks(content).find((block) => block.type === 'resource_link');
+    assert.ok((link?.uri ?? '').startsWith('http://127.0.0.1:'), `got ${String(link?.uri)}`);
+  });
+
+  it('falls back to DEPLOY_URL only when there is no Host header', () => {
+    // Exercised directly: an MCP request always carries Host, so the fallback is
+    // reachable only from a non-HTTP caller.
+    assert.equal(isEphemeralHost(DEPLOY_URL), false);
+  });
+});
+
+describe('F6 — ResourceLink size is the artifact size', () => {
+  it('advertises raw capture bytes, not the extracted character count', async () => {
+    const result = await callTool('get_snapshot', { url: NONCE_URL, timestamp: 'earliest', format: 'raw' });
+    assert.notEqual(result.isError, true, textOf(result));
+    const link = linksOf(result)[0];
+    const totalChars = num(result.structuredContent, 'totalChars');
+    const artifactBytes = num(result.structuredContent, 'artifactBytes');
+    assert.equal(link?.size, artifactBytes);
+    assert.ok(artifactBytes > totalChars * 2, `raw HTML (${String(artifactBytes)}B) should dwarf its text (${String(totalChars)} chars)`);
+    assert.ok(artifactBytes > 1_000, 'a real page is not a handful of bytes');
+  });
+
+  it('advertises the extracted byte length for text format', async () => {
+    const result = await callTool('get_snapshot', { url: TARGET_URL, timestamp: 'latest' });
+    const link = linksOf(result)[0];
+    assert.equal(link?.size, num(result.structuredContent, 'artifactBytes'));
+    assert.ok((link?.size ?? 0) >= num(result.structuredContent, 'totalChars'), 'bytes are never fewer than characters');
+  });
+
+  it('advertises the diff byte length for a capped diff', async () => {
+    const result = await callTool('compare_snapshots', { url: TARGET_URL, maxChars: 1_000 });
+    if (result.structuredContent?.['truncated'] !== true) return;
+    const link = linksOf(result)[0];
+    assert.equal(link?.size, num(result.structuredContent, 'artifactBytes'));
+    assert.ok((link?.size ?? 0) > num(result.structuredContent, 'inlinedChars'));
+  });
+});
+
+describe('F7 — one bad capture does not kill a comparison', () => {
+  it('names the failing endpoint and offers nearest alternatives', async () => {
+    await callTool('clear_cache');
+    const revisions = await callTool('list_revisions', { url: TARGET_URL });
+    const rows = revisions.structuredContent?.['revisions'];
+    assert.ok(Array.isArray(rows) && rows.length >= 3);
+    const victim = asString(asRecord(rows[2])?.['firstSeen']) ?? '';
+    const healthy = asString(asRecord(rows[0])?.['firstSeen']) ?? '';
+
+    fixture.breakCapture(victim);
+    try {
+      const result = await callTool('compare_snapshots', { url: TARGET_URL, timestampA: healthy, timestampB: victim });
+      assert.equal(result.isError, true);
+      const text = textOf(result);
+      assert.match(text, new RegExp(`Capture ${victim} \\(endpoint B\\)`), 'names which endpoint failed');
+      assert.match(text, /Nearest usable alternatives: \d{14}, \d{14}, \d{14}/);
+      assert.match(text, /fetched fine, so this is that one capture rather than a connectivity problem/);
+      assert.ok(!/outbound network access/.test(text), 'must not blame local networking');
+    } finally {
+      fixture.repairCaptures();
+      await callTool('clear_cache');
+    }
+  });
+});
+
+describe('F8 — inline budget is opt-in escalatable', () => {
+  it('defaults to a preview plus a link for a long page', async () => {
+    const result = await callTool('get_snapshot', { url: TARGET_URL, timestamp: 'latest' });
+    assert.equal(num(result.structuredContent, 'maxChars'), 8_000);
+    assert.equal(result.structuredContent?.['truncated'], true);
+    assert.ok(num(result.structuredContent, 'inlinedChars') <= 2_000);
+    assert.equal(linksOf(result).length, 1);
+  });
+
+  it('inlines more when asked, and still attaches the link', async () => {
+    const result = await callTool('get_snapshot', { url: TARGET_URL, timestamp: 'latest', maxChars: 50_000 });
+    const totalChars = num(result.structuredContent, 'totalChars');
+    assert.ok(num(result.structuredContent, 'inlinedChars') > 2_000, 'escalation must inline more than the preview');
+    assert.equal(linksOf(result).length, totalChars > 50_000 ? 1 : 0);
+    assert.match(textOf(result), /45 messages every 5 hours/, 'content past the preview is now visible');
+  });
+
+  it('marks the cut when an escalated read is still truncated', async () => {
+    const result = await callTool('get_snapshot', { url: TARGET_URL, timestamp: 'latest', maxChars: 3_000 });
+    assert.equal(num(result.structuredContent, 'inlinedChars'), 3_000);
+    assert.match(textOf(result), /\[Truncated at 3,000 of [\d,]+ characters\. Re-call with a higher maxChars to see more\.\]/);
+  });
+
+  it('rejects a maxChars above the hard ceiling', async () => {
+    const result = await callTool('get_snapshot', { url: TARGET_URL, maxChars: 500_000 });
+    assert.equal(result.isError, true);
+    assert.match(textOf(result), /invalid_input/);
+  });
+
+  it('applies the same escalation to compare_snapshots', async () => {
+    const tight = await callTool('compare_snapshots', { url: TARGET_URL, maxChars: 1_000 });
+    assert.equal(num(tight.structuredContent, 'maxChars'), 1_000);
+    assert.ok(num(tight.structuredContent, 'inlinedChars') <= 1_000);
+    const roomy = await callTool('compare_snapshots', { url: TARGET_URL, maxChars: 100_000 });
+    assert.ok(num(roomy.structuredContent, 'inlinedChars') >= num(tight.structuredContent, 'inlinedChars'));
   });
 });

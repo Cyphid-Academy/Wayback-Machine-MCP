@@ -82,6 +82,35 @@ describe('FetchUpstreamClient — request shape', () => {
     assert.ok(test.calls[0]?.init.signal !== undefined, 'every request carries a timeout signal');
   });
 
+  it('reports the exact artifact byte length, not a character count (F6)', async () => {
+    // 'Pricing' is 7 chars; the artifact is the whole HTML document.
+    const html = '<html><body><h1>Pricing</h1>' + 'x'.repeat(5_000) + '</body></html>';
+    const test = harness(() => ok(html, 'text/html'));
+    const result = await test.client.get('https://web.archive.org/x');
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.byteLength, Buffer.byteLength(html, 'utf8'));
+    assert.ok(result.byteLength > 5_000);
+  });
+
+  it('counts bytes rather than characters for multi-byte content (F6)', async () => {
+    const text = '日本語のページ';
+    const test = harness(() => ok(text, 'text/plain; charset=utf-8'));
+    const result = await test.client.get('https://web.archive.org/x');
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.byteLength, 21, 'seven three-byte characters');
+    assert.equal(result.body.length, 7);
+  });
+
+  it('preserves the byte length through the cache', async () => {
+    const html = '<html>' + 'y'.repeat(3_000) + '</html>';
+    const test = harness(() => ok(html, 'text/html'));
+    await test.client.get('https://web.archive.org/x', { ttlMs: 60_000 });
+    const cached = await test.client.get('https://web.archive.org/x', { ttlMs: 60_000 });
+    assert.equal(cached.ok && cached.byteLength, Buffer.byteLength(html, 'utf8'));
+  });
+
   it('returns the body, status, content type and final URL', async () => {
     const test = harness(
       () =>
@@ -168,21 +197,66 @@ describe('FetchUpstreamClient — failures', () => {
     assert.equal(test.calls.length, 1, '404 is not retried');
   });
 
-  it('retries a 500 with backoff and succeeds on a later attempt', async () => {
+  it('retries a transient failure on the documented schedule and succeeds later (F7)', async () => {
     const test = harness((_url, attempt) => (attempt < 3 ? new Response('boom', { status: 500 }) : ok('recovered')));
     const result = await test.client.get('https://web.archive.org/x');
     assert.equal(result.ok, true);
     if (result.ok) assert.equal(result.body, 'recovered');
     assert.equal(test.calls.length, 3);
-    assert.deepEqual(test.slept, [500, 1_000], 'exponential backoff');
+    assert.deepEqual(test.slept, [250, 1_000], 'backoff is 250ms then 1s');
   });
 
-  it('gives up after three attempts and reports the upstream status', async () => {
+  it('retries three times before surfacing an error (F7)', async () => {
     const test = harness(() => new Response('boom', { status: 502 }));
     const result = await test.client.get('https://web.archive.org/x');
     assert.equal(result.ok, false);
     if (!result.ok) assert.equal(result.failure.code, 'upstream_error');
+    assert.equal(test.calls.length, 4, 'one attempt plus three retries');
+    assert.deepEqual(test.slept, [250, 1_000, 3_000]);
+  });
+
+  it('recovers a capture that fails twice then succeeds, without surfacing an error (F7)', async () => {
+    const test = harness((_url, attempt) => {
+      if (attempt <= 2) throw new TypeError('fetch failed');
+      return ok('<html>capture</html>', 'text/html');
+    });
+    const result = await test.client.get('https://web.archive.org/web/20240326065629id_/https://example.com/', {
+      errorSubject: 'capture',
+    });
+    assert.equal(result.ok, true, 'two transient failures must not kill the call');
+    if (result.ok) assert.match(result.body, /capture/);
     assert.equal(test.calls.length, 3);
+  });
+
+  it('never blames local networking for one unavailable capture (F7)', async () => {
+    const test = harness(() => {
+      throw new TypeError('fetch failed');
+    });
+    const result = await test.client.get('https://web.archive.org/web/1id_/https://example.com/', {
+      what: 'Capture 20240326065629 of https://example.com/',
+      errorSubject: 'capture',
+    });
+    assert.equal(result.ok, false);
+    if (result.ok) return;
+    assert.equal(result.failure.code, 'upstream_error');
+    assert.match(result.failure.message, /could not be retrieved from the Wayback Machine/);
+    assert.ok(!/outbound network access/.test(result.failure.hint ?? ''), 'must not blame the local host');
+    assert.match(result.failure.hint ?? '', /unavailable upstream|neighbouring timestamp/);
+  });
+
+  it('still blames networking when archive.org itself is unreachable (F7)', async () => {
+    const test = harness(() => {
+      throw new TypeError('fetch failed');
+    });
+    const result = await test.client.get('https://web.archive.org/cdx/search/cdx', {
+      what: 'the CDX capture index',
+      errorSubject: 'service',
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.failure.code, 'network_error');
+      assert.match(result.failure.hint ?? '', /outbound network access/);
+    }
   });
 
   it('honours Retry-After on a 429 and surfaces a rate-limited failure', async () => {
@@ -193,7 +267,7 @@ describe('FetchUpstreamClient — failures', () => {
       assert.equal(result.failure.code, 'rate_limited');
       assert.equal(result.failure.retryAfterMs, 2_000);
     }
-    assert.deepEqual(test.slept, [2_000, 2_000], 'backoff follows Retry-After');
+    assert.deepEqual(test.slept, [2_000, 2_000, 2_000], 'backoff follows Retry-After');
   });
 
   it('reports a timeout as a structured failure rather than throwing', async () => {

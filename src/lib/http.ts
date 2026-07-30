@@ -10,6 +10,8 @@ export interface HttpSuccess {
   readonly status: number;
   readonly body: string;
   readonly contentType: string | undefined;
+  /** Exact bytes read from the wire. The artifact size, as opposed to character count. */
+  readonly byteLength: number;
   /** URL after redirects — Wayback redirects to the nearest capture, which we need. */
   readonly finalUrl: string;
   readonly fromCache: boolean;
@@ -32,6 +34,14 @@ export interface GetOptions {
   readonly maxBytes?: number;
   /** Extra label used in error messages, e.g. "CDX index". */
   readonly what?: string;
+  /** Overrides how long a caller will queue for a rate-limit slot. */
+  readonly maxWaitMs?: number;
+  /**
+   * Shapes failure messages. 'capture' means one specific archived capture, which
+   * may simply be unavailable upstream — never blame local networking for that.
+   * 'service' means archive.org itself, where a connect failure is meaningful.
+   */
+  readonly errorSubject?: 'capture' | 'service';
 }
 
 export interface PostOptions {
@@ -62,8 +72,9 @@ export interface UpstreamClientDeps {
 }
 
 const DEFAULT_MAX_BYTES = 6 * 1024 * 1024;
-const MAX_ATTEMPTS = 3;
-const BASE_BACKOFF_MS = 500;
+/** One initial attempt plus three retries (F7). */
+const MAX_ATTEMPTS = 4;
+const BACKOFF_SCHEDULE_MS = [250, 1_000, 3_000];
 /** How long a caller will wait for a rate-limit slot before being told to retry. */
 const MAX_RATE_LIMIT_WAIT_MS = 12_000;
 
@@ -100,12 +111,12 @@ function decode(bytes: Uint8Array, label: string): string {
 async function readCapped(
   response: Response,
   maxBytes: number,
-): Promise<{ body: string; truncated: boolean }> {
+): Promise<{ body: string; truncated: boolean; byteLength: number }> {
   const label = charsetOf(response.headers.get('content-type') ?? undefined);
   const stream = response.body;
   if (stream === null) {
     const text = await response.text();
-    return { body: text, truncated: false };
+    return { body: text, truncated: false, byteLength: Buffer.byteLength(text, 'utf8') };
   }
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
@@ -126,7 +137,7 @@ async function readCapped(
     chunks.push(chunk);
     total += chunk.byteLength;
   }
-  return { body: decode(Buffer.concat(chunks), label), truncated };
+  return { body: decode(Buffer.concat(chunks), label), truncated, byteLength: total };
 }
 
 /**
@@ -134,17 +145,28 @@ async function readCapped(
  * lose the content type, and a cached HTML capture would then look like opaque
  * bytes on the second request.
  */
-function encodeEnvelope(contentType: string | undefined, finalUrl: string, body: string): string {
-  return `${encodeURIComponent(contentType ?? '')} ${encodeURIComponent(finalUrl)}\n${body}`;
+function encodeEnvelope(contentType: string | undefined, finalUrl: string, byteLength: number, body: string): string {
+  return `${encodeURIComponent(contentType ?? '')} ${encodeURIComponent(finalUrl)} ${String(byteLength)}\n${body}`;
 }
 
-function decodeEnvelope(stored: string): { contentType: string | undefined; finalUrl: string | undefined; body: string } {
+function decodeEnvelope(stored: string): {
+  contentType: string | undefined;
+  finalUrl: string | undefined;
+  byteLength: number | undefined;
+  body: string;
+} {
   const breakAt = stored.indexOf('\n');
-  if (breakAt < 0) return { contentType: undefined, finalUrl: undefined, body: stored };
-  const [rawType, rawUrl] = stored.slice(0, breakAt).split(' ');
+  if (breakAt < 0) return { contentType: undefined, finalUrl: undefined, byteLength: undefined, body: stored };
+  const [rawType, rawUrl, rawBytes] = stored.slice(0, breakAt).split(' ');
   const contentType = rawType === undefined || rawType.length === 0 ? undefined : decodeURIComponent(rawType);
   const finalUrl = rawUrl === undefined || rawUrl.length === 0 ? undefined : decodeURIComponent(rawUrl);
-  return { contentType, finalUrl, body: stored.slice(breakAt + 1) };
+  const parsedBytes = rawBytes === undefined ? Number.NaN : Number.parseInt(rawBytes, 10);
+  return {
+    contentType,
+    finalUrl,
+    byteLength: Number.isFinite(parsedBytes) ? parsedBytes : undefined,
+    body: stored.slice(breakAt + 1),
+  };
 }
 
 function isRetryableStatus(status: number): boolean {
@@ -193,6 +215,7 @@ export class FetchUpstreamClient implements UpstreamClient {
           status: 200,
           body: envelope.body,
           contentType: envelope.contentType,
+          byteLength: envelope.byteLength ?? Buffer.byteLength(envelope.body, 'utf8'),
           finalUrl: envelope.finalUrl ?? url,
           fromCache: true,
           truncated: false,
@@ -206,10 +229,16 @@ export class FetchUpstreamClient implements UpstreamClient {
       maxBytes: options.maxBytes ?? DEFAULT_MAX_BYTES,
       attempts: MAX_ATTEMPTS,
       ...(options.what === undefined ? {} : { what: options.what }),
+      ...(options.maxWaitMs === undefined ? {} : { maxWaitMs: options.maxWaitMs }),
+      ...(options.errorSubject === undefined ? {} : { errorSubject: options.errorSubject }),
     });
 
     if (outcome.ok && ttlMs > 0 && !outcome.truncated) {
-      await this.cache.set(url, encodeEnvelope(outcome.contentType, outcome.finalUrl, outcome.body), ttlMs);
+      await this.cache.set(
+        url,
+        encodeEnvelope(outcome.contentType, outcome.finalUrl, outcome.byteLength, outcome.body),
+        ttlMs,
+      );
     }
     return outcome;
   }
@@ -272,13 +301,16 @@ export class FetchUpstreamClient implements UpstreamClient {
       contentType?: string;
       extraHeaders?: Readonly<Record<string, string>>;
       what?: string;
+      maxWaitMs?: number;
+      errorSubject?: 'capture' | 'service';
     },
   ): Promise<HttpOutcome> {
     const what = options.what ?? 'archive.org';
+    const subject = options.errorSubject ?? 'service';
     let lastFailure: Failure | undefined;
 
     for (let attempt = 1; attempt <= options.attempts; attempt += 1) {
-      const slot = await this.limiter.acquire(MAX_RATE_LIMIT_WAIT_MS);
+      const slot = await this.limiter.acquire(options.maxWaitMs ?? MAX_RATE_LIMIT_WAIT_MS);
       if (!slot.ok) {
         return {
           ok: false,
@@ -332,12 +364,13 @@ export class FetchUpstreamClient implements UpstreamClient {
             }),
           };
         } else {
-          const { body, truncated } = await readCapped(response, options.maxBytes);
+          const { body, truncated, byteLength } = await readCapped(response, options.maxBytes);
           return {
             ok: true,
             status: response.status,
             body,
             contentType: response.headers.get('content-type') ?? undefined,
+            byteLength,
             finalUrl: response.url.length > 0 ? response.url : url,
             fromCache: false,
             truncated,
@@ -345,19 +378,29 @@ export class FetchUpstreamClient implements UpstreamClient {
         }
       } catch (error) {
         const isAbort = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
-        lastFailure = isAbort
-          ? failure(
-              'timeout',
-              `${what} did not respond within ${String(Math.round(this.config.upstreamTimeoutMs / 1000))}s.`,
-              { hint: 'archive.org is slow or the capture is very large. Narrow the query and retry.' },
-            )
-          : failure('network_error', `Could not reach ${what}: ${error instanceof Error ? error.message : String(error)}.`, {
-              hint: 'Check outbound network access from the host running this server.',
-            });
+        if (isAbort) {
+          lastFailure = failure(
+            'timeout',
+            `${what} did not respond within ${String(Math.round(this.config.upstreamTimeoutMs / 1000))}s.`,
+            { hint: 'archive.org is slow or the capture is very large. Narrow the query and retry.' },
+          );
+        } else if (subject === 'capture') {
+          // A specific capture failing says nothing about local networking (F7).
+          lastFailure = failure('upstream_error', `${what} could not be retrieved from the Wayback Machine.`, {
+            hint: 'That capture may be incomplete or unavailable upstream. Other captures of the same URL are usually still reachable — try a neighbouring timestamp.',
+          });
+        } else {
+          lastFailure = failure(
+            'network_error',
+            `Could not reach ${what}: ${error instanceof Error ? error.message : String(error)}.`,
+            { hint: 'This is a connect-level failure against archive.org itself. Check outbound network access from the host running this server.' },
+          );
+        }
       }
 
       if (attempt < options.attempts) {
-        const backoff = lastFailure?.retryAfterMs ?? BASE_BACKOFF_MS * 2 ** (attempt - 1);
+        const scheduled = BACKOFF_SCHEDULE_MS[attempt - 1] ?? BACKOFF_SCHEDULE_MS[BACKOFF_SCHEDULE_MS.length - 1] ?? 3_000;
+        const backoff = lastFailure?.retryAfterMs ?? scheduled;
         this.logger?.warn('upstream retry', { url, attempt, backoffMs: Math.min(backoff, 5_000) });
         await this.sleep(Math.min(backoff, 5_000));
       }

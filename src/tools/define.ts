@@ -5,11 +5,17 @@ import type { RateLimiter } from '../lib/ratelimit.js';
 import type { UpstreamClient } from '../lib/http.js';
 import type { Logger } from '../lib/log.js';
 import { failure, formatFailure, fromUnknown, type Failure } from '../lib/errors.js';
-import type { ResourceLinkBlock } from '../lib/resources.js';
+import type { ResourceBase, ResourceLinkBlock } from '../lib/resources.js';
 import { toJsonSchema, type JsonSchemaObject } from '../schemas.js';
 
 export interface ToolContext {
   readonly config: Config;
+  /**
+   * Base URL and path secret for resource links, resolved from the incoming
+   * request rather than from configuration, so a link never points at the wrong
+   * host (F5).
+   */
+  readonly resourceBase: ResourceBase;
   readonly cache: CacheBackend;
   readonly limiter: RateLimiter;
   readonly upstream: UpstreamClient;

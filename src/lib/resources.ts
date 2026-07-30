@@ -1,5 +1,9 @@
-import type { Config } from '../config.js';
-import { resourceBasePath } from '../config.js';
+/** Absolute base URL plus path secret, resolved per request — see F5 in the fix spec. */
+export interface ResourceBase {
+  /** e.g. https://my-app.replit.app — no trailing slash. */
+  readonly baseUrl: string;
+  readonly pathSecret: string;
+}
 
 /**
  * Build spec §2: anything whose extracted text is longer than this comes back as
@@ -48,18 +52,27 @@ export function resourceLink(input: ResourceLinkInput): ResourceLinkBlock {
   };
 }
 
-export function snapshotResourceUri(config: Config, timestamp: string, url: string, format: string): string {
-  return `${config.deployUrl}${resourceBasePath(config)}/snapshot/${timestamp}/${encodeURIComponent(url)}?format=${encodeURIComponent(format)}`;
+export function snapshotResourceUri(base: ResourceBase, timestamp: string, url: string, format: string): string {
+  return `${base.baseUrl}/r/${base.pathSecret}/snapshot/${timestamp}/${encodeURIComponent(url)}?format=${encodeURIComponent(format)}`;
 }
 
 export function diffResourceUri(
-  config: Config,
+  base: ResourceBase,
   timestampA: string,
   timestampB: string,
   url: string,
   granularity: string,
 ): string {
-  return `${config.deployUrl}${resourceBasePath(config)}/diff/${timestampA}/${timestampB}/${encodeURIComponent(url)}?granularity=${encodeURIComponent(granularity)}`;
+  return `${base.baseUrl}/r/${base.pathSecret}/diff/${timestampA}/${timestampB}/${encodeURIComponent(url)}?granularity=${encodeURIComponent(granularity)}`;
+}
+
+/** True for a Replit workspace domain, whose links die when the workspace sleeps (F5). */
+export function isEphemeralHost(baseUrl: string): boolean {
+  try {
+    return /\.replit\.dev$/i.test(new URL(baseUrl).hostname);
+  } catch {
+    return false;
+  }
 }
 
 export interface TextPayload {
@@ -72,13 +85,34 @@ export interface TextPayload {
   readonly truncated: boolean;
 }
 
-/** The 8,000-character decision, in one place so every tool behaves identically. */
+/** Hard ceiling on an opt-in `maxChars` escalation (F8). */
+export const MAX_INLINE_CHARS = 100_000;
+
+/**
+ * The inline-versus-link decision, in one place so every tool behaves identically.
+ *
+ * At the default limit an oversized document yields a 2,000-character preview plus
+ * a resource link. When the caller opts into a higher `limit`, the text is inlined
+ * up to that many characters — claude.ai does not resolve resource links, so the
+ * escalation is the only way to see more (F8).
+ */
 export function textPayload(text: string, limit: number = INLINE_TEXT_LIMIT): TextPayload {
   const totalChars = text.length;
   if (totalChars <= limit) {
     return { inline: text, preview: text.slice(0, PREVIEW_CHARS), totalChars, truncated: false };
   }
+  if (limit !== INLINE_TEXT_LIMIT) {
+    // The caller set an explicit budget, so honour it literally: inline up to
+    // `limit` characters and say what was cut. Only the default limit produces
+    // the preview-plus-resource-link shape.
+    return { inline: text.slice(0, limit), preview: text.slice(0, PREVIEW_CHARS), totalChars, truncated: true };
+  }
   return { inline: undefined, preview: text.slice(0, PREVIEW_CHARS), totalChars, truncated: true };
+}
+
+/** The marker appended when an escalated inline read was still cut short (F8). */
+export function truncationNotice(shown: number, total: number): string {
+  return `[Truncated at ${shown.toLocaleString('en-US')} of ${total.toLocaleString('en-US')} characters. Re-call with a higher maxChars to see more.]`;
 }
 
 export function mimeTypeForFormat(format: string): string {

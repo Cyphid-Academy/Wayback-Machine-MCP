@@ -1,5 +1,50 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { BODIES, CAPTURES, ITEM_IDENTIFIER, ITEM_METADATA, SEARCH_DOCS, TARGET_URL, type FixtureCapture } from './pages.js';
+import {
+  BODIES,
+  CAPTURES,
+  GAP_CAPTURES,
+  GAP_URL,
+  ITEM_IDENTIFIER,
+  ITEM_METADATA,
+  MIXED_STATUS_CAPTURES,
+  MIXED_STATUS_URL,
+  NONCE_CAPTURES,
+  NONCE_URL,
+  PREFIX_CAPTURES,
+  PREFIX_ORIGINALS,
+  PREFIX_SLUG_A,
+  PREFIX_STEM,
+  REDIRECT_ONLY_CAPTURES,
+  REDIRECT_ONLY_URL,
+  SEARCH_DOCS,
+  TARGET_URL,
+  noncePageHtml,
+  type FixtureCapture,
+} from './pages.js';
+
+/**
+ * Every URL the fixture archive knows about. `prefixOf` lets one entry answer a
+ * `matchType=prefix` query for a stem that has no captures of its own (F1).
+ */
+interface FixtureSite {
+  readonly url: string;
+  readonly captures: readonly FixtureCapture[];
+  /** Overrides the reported `original` per capture, for multi-slug prefix matches. */
+  readonly originals?: ReadonlyMap<string, string>;
+  /** A stem that should match this site under matchType=prefix. */
+  readonly prefixOf?: string;
+  /** Generates a body per timestamp; falls back to the digest-keyed BODIES map. */
+  readonly bodyFor?: (timestamp: string) => string;
+}
+
+const SITES: readonly FixtureSite[] = [
+  { url: TARGET_URL, captures: CAPTURES },
+  { url: PREFIX_SLUG_A, captures: PREFIX_CAPTURES, originals: PREFIX_ORIGINALS, prefixOf: PREFIX_STEM },
+  { url: REDIRECT_ONLY_URL, captures: REDIRECT_ONLY_CAPTURES },
+  { url: MIXED_STATUS_URL, captures: MIXED_STATUS_CAPTURES },
+  { url: GAP_URL, captures: GAP_CAPTURES },
+  { url: NONCE_URL, captures: NONCE_CAPTURES, bodyFor: noncePageHtml },
+];
 
 /**
  * A stand-in for web.archive.org and archive.org, good enough to exercise the CDX
@@ -16,6 +61,9 @@ export interface FixtureUpstream {
   close(): Promise<void>;
   /** Makes the next `count` CDX requests fail with the given status. */
   failNext(count: number, status: number, retryAfterSeconds?: number): void;
+  /** Makes one capture permanently unfetchable, as archive.org sometimes does (F7). */
+  breakCapture(timestamp: string): void;
+  repairCaptures(): void;
 }
 
 function normalizeKey(url: string): string {
@@ -74,11 +122,25 @@ function applyCollapse(captures: readonly FixtureCapture[], collapses: readonly 
   return rows;
 }
 
+/** Resolves a CDX query to a fixture site, honouring matchType=prefix. */
+function siteFor(requested: string, matchType: string): FixtureSite | undefined {
+  const key = normalizeKey(requested);
+  const exact = SITES.find((site) => normalizeKey(site.url) === key);
+  if (exact !== undefined) return exact;
+  if (matchType === 'prefix' || matchType === 'host' || matchType === 'domain') {
+    return SITES.find(
+      (site) => normalizeKey(site.prefixOf ?? '') === key || normalizeKey(site.url).startsWith(key),
+    );
+  }
+  return undefined;
+}
+
 function cdxResponse(params: URLSearchParams): string {
   const requested = params.get('url') ?? '';
-  if (normalizeKey(requested) !== normalizeKey(TARGET_URL)) return '';
+  const site = siteFor(requested, params.get('matchType') ?? 'exact');
+  if (site === undefined) return '';
 
-  let rows = applyFilters(CAPTURES, params.getAll('filter'));
+  let rows = applyFilters(site.captures, params.getAll('filter'));
   const from = params.get('from');
   const to = params.get('to');
   if (from !== null) rows = rows.filter((row) => row.timestamp >= from.padEnd(14, '0'));
@@ -100,11 +162,11 @@ function cdxResponse(params: URLSearchParams): string {
   const valueFor = (row: FixtureCapture, field: string): string => {
     switch (field) {
       case 'urlkey':
-        return 'org,example,support)/en/articles/8325612';
+        return 'org,example,support)/fixture';
       case 'timestamp':
         return row.timestamp;
       case 'original':
-        return `https://${TARGET_URL}`;
+        return site.originals?.get(row.timestamp) ?? `https://${site.url}`;
       case 'mimetype':
         return row.mimetype;
       case 'statuscode':
@@ -120,11 +182,11 @@ function cdxResponse(params: URLSearchParams): string {
   return JSON.stringify([fields, ...rows.map((row) => fields.map((field) => valueFor(row, field)))]);
 }
 
-function nearestCapture(timestamp: string): FixtureCapture | undefined {
+function nearestCapture(timestamp: string, captures: readonly FixtureCapture[] = CAPTURES): FixtureCapture | undefined {
   const target = timestamp.padEnd(14, '0');
   let best: FixtureCapture | undefined;
   let bestDistance = Number.POSITIVE_INFINITY;
-  for (const capture of CAPTURES) {
+  for (const capture of captures) {
     if (capture.statuscode !== '200') continue;
     const distance = Math.abs(Number(capture.timestamp) - Number(target));
     if (distance < bestDistance) {
@@ -157,6 +219,7 @@ function sparkline(): string {
 export async function startFixtureUpstream(): Promise<FixtureUpstream> {
   const requests: string[] = [];
   const userAgents: string[] = [];
+  const brokenCaptures = new Set<string>();
   let failures = 0;
   let failureStatus = 500;
   let retryAfter: number | undefined;
@@ -188,13 +251,14 @@ export async function startFixtureUpstream(): Promise<FixtureUpstream> {
 
     if (url.pathname === '/wayback/available') {
       const target = url.searchParams.get('url') ?? '';
-      if (normalizeKey(target) !== normalizeKey(TARGET_URL)) {
+      const site = siteFor(target, 'exact');
+      if (site === undefined) {
         send(200, JSON.stringify({ url: target, archived_snapshots: {} }));
         return;
       }
       const stampParam = url.searchParams.get('timestamp');
-      const live = CAPTURES.filter((capture) => capture.statuscode === '200');
-      const capture = stampParam === null ? live[live.length - 1] : nearestCapture(stampParam);
+      const live = site.captures.filter((capture) => capture.statuscode === '200');
+      const capture = stampParam === null ? live[live.length - 1] : nearestCapture(stampParam, live);
       if (capture === undefined) {
         send(200, JSON.stringify({ url: target, archived_snapshots: {} }));
         return;
@@ -207,7 +271,7 @@ export async function startFixtureUpstream(): Promise<FixtureUpstream> {
             closest: {
               status: '200',
               available: true,
-              url: `http://web.archive.org/web/${capture.timestamp}/https://${TARGET_URL}`,
+              url: `http://web.archive.org/web/${capture.timestamp}/https://${site.url}`,
               timestamp: capture.timestamp,
             },
           },
@@ -223,6 +287,13 @@ export async function startFixtureUpstream(): Promise<FixtureUpstream> {
       return;
     }
 
+    // Lets a test make one specific capture unfetchable, for F7.
+    if (url.pathname === '/__fixture/break-capture') {
+      brokenCaptures.add(url.searchParams.get('timestamp') ?? '');
+      send(200, JSON.stringify({ ok: true }));
+      return;
+    }
+
     // /web/{timestamp}{modifier}/{url}
     const capture = /^\/web\/(\d{4,14})([a-z]{2}_)?\/(.+)$/i.exec(url.pathname + url.search);
     if (capture !== null) {
@@ -233,14 +304,20 @@ export async function startFixtureUpstream(): Promise<FixtureUpstream> {
         send(404, 'no screenshot', 'text/plain');
         return;
       }
-      if (normalizeKey(target) !== normalizeKey(TARGET_URL)) {
+      const site = siteFor(target, 'exact');
+      if (site === undefined) {
         send(404, 'not in archive', 'text/plain');
         return;
       }
-      const exact = CAPTURES.find((row) => row.timestamp === timestamp && row.statuscode === '200');
+      if (brokenCaptures.has(timestamp)) {
+        // Destroy the socket: the same shape as a capture that is simply gone (F7).
+        res.destroy();
+        return;
+      }
+      const exact = site.captures.find((row) => row.timestamp === timestamp && row.statuscode === '200');
       if (exact === undefined) {
         // Mirror the real behaviour: redirect to the nearest capture.
-        const nearest = nearestCapture(timestamp);
+        const nearest = nearestCapture(timestamp, site.captures.filter((row) => row.statuscode === '200'));
         if (nearest === undefined) {
           send(404, 'not in archive', 'text/plain');
           return;
@@ -249,7 +326,11 @@ export async function startFixtureUpstream(): Promise<FixtureUpstream> {
         res.end();
         return;
       }
-      send(200, BODIES.get(exact.digest) ?? '<html><body>missing fixture</body></html>', 'text/html; charset=utf-8');
+      const body =
+        site.bodyFor !== undefined
+          ? site.bodyFor(exact.timestamp)
+          : (BODIES.get(exact.digest) ?? '<html><body>missing fixture</body></html>');
+      send(200, body, 'text/html; charset=utf-8');
       return;
     }
 
@@ -310,6 +391,12 @@ export async function startFixtureUpstream(): Promise<FixtureUpstream> {
       failures = count;
       failureStatus = status;
       retryAfter = retryAfterSeconds;
+    },
+    breakCapture(timestamp) {
+      brokenCaptures.add(timestamp);
+    },
+    repairCaptures() {
+      brokenCaptures.clear();
     },
     close: () =>
       new Promise<void>((resolve, reject) => {

@@ -1,9 +1,16 @@
 import { z } from 'zod';
 import { getSnapshotInput, getSnapshotOutput } from '../schemas.js';
-import { fetchCaptureText, resolveTimestamp } from '../lib/wayback.js';
+import { fetchCaptureText, offsetNotice, resolveTimestamp } from '../lib/wayback.js';
 import { normalizeTargetUrl, waybackCaptureUrl } from '../lib/urls.js';
 import { timestampToIso } from '../lib/timestamps.js';
-import { mimeTypeForFormat, resourceLink, snapshotResourceUri, textPayload, type ResourceLinkBlock } from '../lib/resources.js';
+import {
+  mimeTypeForFormat,
+  resourceLink,
+  snapshotResourceUri,
+  textPayload,
+  truncationNotice,
+  type ResourceLinkBlock,
+} from '../lib/resources.js';
 import { defineTool, fail, succeed, type ToolModule } from './define.js';
 import { bytes, count, shortDateTime } from './format.js';
 
@@ -14,7 +21,7 @@ export const getSnapshotTool: ToolModule = defineTool<Input, Output>({
   name: 'get_snapshot',
   title: 'Read one archived capture',
   description:
-    'Fetches one capture of a URL and returns it as chrome-stripped text or markdown: navigation, headers, footers, cookie banners and language switchers are removed, so what comes back is the page content. The capture is fetched with the id_ modifier, i.e. the original bytes, not the Wayback-wrapped replay page. Small pages come back in full; anything over 8,000 characters returns a 2,000-character preview plus a resource link to the whole thing, because a full page capture will not fit in a tool result. timestamp accepts "latest", "earliest", or any date — partial dates resolve to the closest capture. format="raw" never inlines the bytes and only returns a resource link. Use check_availability or list_revisions first to pick a timestamp worth reading.',
+    'Fetches one capture of a URL and returns it as chrome-stripped text or markdown: navigation, headers, footers, cookie banners and language switchers are removed, so what comes back is the page content. The capture is fetched with the id_ modifier, i.e. the original bytes, not the Wayback-wrapped replay page. timestamp accepts "latest", "earliest", or any date — a partial date resolves to the nearest capture, and the result always tells you which capture you actually got and how many days that is from what you asked for, so content is never misattributed to the wrong date. By default a page longer than 8,000 characters returns a 2,000-character preview plus a resource link; raise maxChars (up to 100,000) to inline more of the text directly. format="raw" never inlines the bytes. Use check_availability or list_revisions first to pick a timestamp worth reading.',
   annotations: { title: 'Read one archived capture', readOnlyHint: true, openWorldHint: true },
   input: getSnapshotInput,
   output: getSnapshotOutput,
@@ -30,14 +37,21 @@ export const getSnapshotTool: ToolModule = defineTool<Input, Output>({
     // `raw` is still extracted for the preview: build spec §2 forbids putting raw
     // HTML in `content`, so the bytes themselves are only reachable via the link.
     const extractMode = input.format === 'markdown' ? 'markdown' : 'text';
-    const capture = await fetchCaptureText(deps, url, resolved.value, extractMode, input.modifier ?? 'id_');
+    const capture = await fetchCaptureText(deps, url, resolved.value.timestamp, extractMode, {
+      modifier: input.modifier ?? 'id_',
+    });
     if (!capture.ok) return fail(capture.failure);
 
     const value = capture.value;
-    const payload = textPayload(value.text);
-    const inlineFull = input.format !== 'raw' && payload.inline !== undefined;
-    const needsLink = !inlineFull;
-    const uri = needsLink ? snapshotResourceUri(ctx.config, value.timestamp, url, input.format) : null;
+    const payload = textPayload(value.text, input.maxChars);
+    const inlineFull = input.format !== 'raw' && payload.inline !== undefined && !payload.truncated;
+    const needsLink = input.format === 'raw' || payload.truncated;
+    const uri = needsLink ? snapshotResourceUri(ctx.resourceBase, value.timestamp, url, input.format) : null;
+
+    // F6: the link advertises the artifact's byte length, never a character count.
+    const artifactBytes =
+      input.format === 'raw' ? value.byteLength : Buffer.byteLength(value.text, 'utf8');
+    const inlinedChars = input.format === 'raw' ? 0 : (payload.inline ?? payload.preview).length;
 
     const structured: Output = {
       url,
@@ -50,8 +64,12 @@ export const getSnapshotTool: ToolModule = defineTool<Input, Output>({
       title: value.title ?? null,
       format: input.format,
       totalChars: payload.totalChars,
-      truncated: needsLink,
+      artifactBytes,
+      inlinedChars,
+      maxChars: input.maxChars,
+      truncated: payload.truncated || input.format === 'raw',
       resourceUri: uri,
+      offsetDays: resolved.value.offsetDays,
       bodyTruncated: value.bodyTruncated,
     };
 
@@ -64,20 +82,24 @@ export const getSnapshotTool: ToolModule = defineTool<Input, Output>({
           title: value.title ?? `Capture of ${url} at ${shortDateTime(value.timestamp)}`,
           description:
             input.format === 'raw'
-              ? `Original bytes of the ${shortDateTime(value.timestamp)} capture (${value.mimeType}).`
+              ? `Original bytes of the ${shortDateTime(value.timestamp)} capture (${value.mimeType}, ${bytes(artifactBytes)}).`
               : `Full ${input.format} extraction of the ${shortDateTime(value.timestamp)} capture, ${count(payload.totalChars)} characters.`,
           mimeType: input.format === 'raw' ? value.mimeType.split(';')[0] ?? 'application/octet-stream' : mimeTypeForFormat(input.format),
-          size: payload.totalChars,
+          size: artifactBytes,
         }),
       );
     }
 
+    const notice = offsetNotice(resolved.value);
     const header = [
+      ...(notice === undefined ? [] : [notice, '']),
       `${url}`,
       `Capture ${value.timestamp} (${shortDateTime(value.timestamp)}), ${value.mimeType}${value.wasHtml ? '' : ' — not HTML, returned as plain text'}`,
       value.title === undefined ? '' : `Title: ${value.title}`,
-      `Extracted ${count(payload.totalChars)} characters${value.bodyTruncated ? ' (upstream body hit the server byte cap)' : ''}`,
-    ].filter((line) => line.length > 0);
+      `Extracted ${count(payload.totalChars)} characters, artifact ${bytes(artifactBytes)}${
+        value.bodyTruncated ? ' (upstream body hit the server byte cap)' : ''
+      }`,
+    ].filter((line) => line.length > 0 || line === '');
 
     if (input.format === 'raw') {
       return succeed(
@@ -98,16 +120,25 @@ export const getSnapshotTool: ToolModule = defineTool<Input, Output>({
       return succeed(structured, [...header, '', payload.inline ?? ''].join('\n'), links);
     }
 
+    // Escalated inline read: as much as maxChars allowed, plus what was cut (F8).
+    if (payload.inline !== undefined) {
+      return succeed(
+        structured,
+        [...header, '', payload.inline, '', truncationNotice(payload.inline.length, payload.totalChars)].join('\n'),
+        links,
+      );
+    }
+
     return succeed(
       structured,
       [
         ...header,
-        `Too large to inline (limit 8,000 characters); full ${input.format} is behind the resource link below.`,
+        `Too large to inline at maxChars=${count(input.maxChars)}; raise maxChars (up to 100,000) to see more inline.`,
         '',
-        `Preview (first ${count(payload.preview.length)} characters):`,
+        `Preview (first ${count(payload.preview.length)} characters of ${count(payload.totalChars)}):`,
         payload.preview,
         '',
-        `Full text: ${uri ?? ''} (${bytes(payload.totalChars)})`,
+        truncationNotice(payload.preview.length, payload.totalChars),
       ].join('\n'),
       links,
     );
