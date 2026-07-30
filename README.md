@@ -231,7 +231,22 @@ npx @modelcontextprotocol/inspector --cli http://localhost:3000/mcp/<secret> \
 
 ## Deploying to Replit Autoscale
 
-1. **Import this repository** into Replit (Create → Import from GitHub).
+1. **Import this repository into Replit.** Use Replit's GitHub import, not "create
+   an app from a prompt" — the import brings the repository in as the app itself
+   and reads the committed `.replit` below, whereas prompting an agent to build an
+   app produces a scaffold that this project then has to be untangled from.
+
+   - *Rapid import* (public repositories): open
+     `https://replit.com/github.com/{owner}/{repo}` — for this repository,
+     <https://replit.com/github.com/Cyphid-Academy/Wayback-Machine-MCP> — and press
+     Enter.
+   - *Guided import* (public or private): open <https://replit.com/import>, choose
+     GitHub, connect the account, pick the repository, and select Import.
+
+   The import brings across the files, the dependency manifest and the run/build
+   configuration. It imports the repository's **default branch**, so if the work
+   lives on a feature branch either make that branch the default first or switch
+   to it in the workspace's Git pane after importing.
 2. **Check `.replit`.** It is already correct and should not need editing:
 
    ```toml

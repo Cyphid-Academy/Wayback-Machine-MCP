@@ -85,6 +85,33 @@ Consequences, each one a deliberate response rather than a workaround:
 
 ---
 
+## How this project should reach Replit
+
+**Replit's MCP server cannot create an app from a repository URL.** Its full tool
+surface was checked: app creation and modification both take a natural-language
+prompt and nothing else (app creation additionally takes a stack from a fixed
+enum, none of which is a headless Node service). The listing and lookup tools are
+read-only, and the one remaining tool that accepts a URL imports a single
+self-contained HTML bundle from Claude Design's export flow, not a git repository.
+There is no branch, clone or import parameter anywhere in the surface.
+
+So the only route through MCP is to have the agent create a scaffolded app and
+then ask it to clone the repository — which is exactly the wrong shape. The agent
+lands the clone in a subfolder of a scaffold it has already generated, so the
+committed `.replit` is not at the app root where Replit reads it, and the scaffold
+leaves behind a competing package manifest and workspace files. It can be
+untangled afterwards by moving the project to the root and deleting the scaffold,
+but it should not be necessary.
+
+**Use Replit's own GitHub import instead**, either the rapid import at
+`replit.com/github.com/{owner}/{repo}` for a public repository or the guided
+import at `replit.com/import`. That brings the repository in as the app itself,
+reads the committed `.replit`, and picks up the dependency manifest and run/build
+configuration — no scaffold, nothing to undo. Note that it imports the
+repository's **default branch**. The README documents both flows.
+
+---
+
 ## Deviations from the spec, with reasons
 
 ### `list_revisions` derives revisions client-side instead of using `collapse=digest`
