@@ -13,11 +13,14 @@ export type RateLimitOutcome = RateLimitGrant | RateLimitDenial;
 export interface RateLimiter {
   /**
    * Reserves one upstream request slot, sleeping up to `maxWaitMs` for capacity.
-   * Denies rather than throwing when the wait would be longer than that.
+   * Denies rather than throwing when the wait would be longer than that — callers
+   * absorb the wait as latency, and only a genuinely long queue becomes an error.
    */
   acquire(maxWaitMs: number): Promise<RateLimitOutcome>;
   /** Called when upstream says 429/503: blocks new requests for `ms`. */
   penalize(ms: number): void;
+  /** How many callers are currently queued behind the bucket. */
+  queueDepth(): number;
 }
 
 export interface TokenBucketOptions {
@@ -45,6 +48,7 @@ export class InMemoryTokenBucket implements RateLimiter {
   private tokens: number;
   private lastRefill: number;
   private blockedUntil = 0;
+  private queued = 0;
 
   constructor(options: TokenBucketOptions) {
     this.capacity = Math.max(1, options.capacity);
@@ -53,6 +57,10 @@ export class InMemoryTokenBucket implements RateLimiter {
     this.sleep = options.sleep ?? defaultSleep;
     this.tokens = this.capacity;
     this.lastRefill = this.now();
+  }
+
+  queueDepth(): number {
+    return this.queued;
   }
 
   async acquire(maxWaitMs: number): Promise<RateLimitOutcome> {
@@ -69,7 +77,14 @@ export class InMemoryTokenBucket implements RateLimiter {
       this.tokens += 1;
       return { ok: false, retryAfterMs: Math.ceil(waitMs) };
     }
-    if (waitMs > 0) await this.sleep(Math.ceil(waitMs));
+    if (waitMs > 0) {
+      this.queued += 1;
+      try {
+        await this.sleep(Math.ceil(waitMs));
+      } finally {
+        this.queued -= 1;
+      }
+    }
     return { ok: true, waitedMs: Math.ceil(waitMs) };
   }
 

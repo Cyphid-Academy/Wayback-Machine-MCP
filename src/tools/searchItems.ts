@@ -2,11 +2,12 @@ import { z } from 'zod';
 import { advancedSearchResponseSchema, searchItemsInput, searchItemsOutput } from '../schemas.js';
 import { CACHE_TTL } from '../lib/cache.js';
 import { MAX_TABLE_ROWS } from '../lib/resources.js';
-import { defineTool, fail, succeed, type ToolModule } from './define.js';
+import { defineTool, fail, succeed, type ToolModule, type WithoutSummary } from './define.js';
 import { count, summary } from './format.js';
 
 type Input = z.infer<typeof searchItemsInput>;
 type Output = z.infer<typeof searchItemsOutput>;
+type Structured = WithoutSummary<Output>;
 type Row = z.infer<typeof searchItemsOutput>['items'][number];
 
 const DEFAULT_FIELDS = ['identifier', 'title', 'creator', 'date', 'mediatype'];
@@ -66,7 +67,7 @@ export const searchItemsTool: ToolModule = defineTool<Input, Output>({
       ];
     });
 
-    const structured: Output = {
+    const structured: Structured = {
       query,
       items,
       numFound: body.numFound,

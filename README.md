@@ -30,7 +30,7 @@ So this server reduces server-side and returns handles for the rest:
 |---|---|
 | `content` (text) | a compact human-readable summary, kept under ~2,000 characters |
 | `structuredContent` | typed JSON matching each tool's `outputSchema` |
-| `ResourceLink` | a URI plus metadata for the full artifact, which the host may fetch or ignore |
+| `ResourceLink` | a URI plus metadata for the full artifact, readable over HTTP or via MCP `resources/read` |
 
 Concretely:
 
@@ -39,11 +39,17 @@ Concretely:
 - Diffs are capped at **15,000 characters**, with a `ResourceLink` to the full diff beyond that.
 - Table-shaped results (capture rows, revisions) are trimmed to 250 rows, and the tool tells the caller how to page.
 
-Both character limits are the *defaults*. Because claude.ai turns out not to fetch
-resource links (see `DECISIONS-MADE.md`), `get_snapshot` and `compare_snapshots`
-accept a `maxChars` parameter — up to 100,000 — that inlines more text directly.
-That is opt-in escalation, not paging: there is no `offset`, and a document is
-never chunked across calls.
+Both character limits are the *defaults*. `get_snapshot` and `compare_snapshots`
+accept a `maxChars` parameter — up to 100,000 — that inlines more directly. That is
+opt-in escalation, not paging: there is no `offset`, and a document is never chunked
+across calls.
+
+**Content is always inlined; a resource link is an addition, never a substitute.**
+Link resolution cannot be relied on across clients, so the payload is delivered in
+both the text block and a named `structuredContent` field (`text`, `diff`), and
+every tool repeats its summary in a `summary` field. Some clients surface only
+`structuredContent` and drop text blocks entirely — see `DECISIONS-MADE.md`. The
+one exception is `format="raw"`, where the bytes are deliberately link-only.
 
 ---
 
@@ -203,6 +209,11 @@ scale-to-zero without any persistence layer.
 | `GET /healthz` | `200 ok` immediately, touching nothing |
 | `GET /` | Server info: name, version, protocol versions, tool names. Never the secret. |
 
+The same artifacts are readable in-protocol: the server declares the MCP
+`resources` capability and implements `resources/read` over exactly these URIs,
+plus `resources/templates/list` describing the two artifact shapes. `resources/list`
+is empty by design — the addressable set is every capture in the Wayback Machine.
+
 Resource URIs are built from the **`Host` header of the request that produced
 them** (honouring `X-Forwarded-Proto`), so a link emitted by the deployment points
 at the deployment. `DEPLOY_URL` is only the fallback for a caller that sends no
@@ -327,8 +338,9 @@ All query tools work anonymously. No Internet Archive account is needed.
 
 Further optional settings: `ALLOWED_ORIGINS` (extra browser origins),
 `MCP_SSE=true` (stream MCP responses as SSE instead of plain JSON),
-`RATE_LIMIT_PER_MINUTE` (default 10), `UPSTREAM_TIMEOUT_MS` (default 25000),
-`PORT`, `HOST`.
+`ARCHIVE_RPM` (archive.org requests per minute, default 60 — raise it for finer
+text-digest sampling), `UPSTREAM_TIMEOUT_MS` (default 25000), `PORT`, `HOST`.
+`RATE_LIMIT_PER_MINUTE` is still honoured as the older name for `ARCHIVE_RPM`.
 
 ---
 
@@ -383,7 +395,8 @@ What ships instead, behind swappable interfaces:
 - **The first connector handshake after an idle period will probably time out.** Autoscale scales to zero after ~15 minutes idle and cold-starts in 10–30s, while the client wants a response sooner. Retrying once connects. If it becomes annoying, move to a Reserved VM rather than optimising further.
 - **Tool results are size-capped.** Page text over 8,000 characters and diffs over 15,000 characters are not inlined; you get a preview plus a `ResourceLink`. Row-shaped results are trimmed to 250 rows and tell you how to page. This is the constraint the whole design exists to satisfy — an oversized result would fail the call outright.
 - **Whether claude.ai resolves a `ResourceLink` from a tool result is unverified.** If it does not, nothing breaks: `archive_stats`, `list_revisions` and `compare_snapshots` return everything needed inline, and the `/r/...` routes stay useful from Claude Code, Cowork and a browser. See `DECISIONS-MADE.md`.
-- **CDX content digests are unreliable on many modern pages.** The Wayback digest is a hash of the delivered bytes, so a Next.js build id or an embedded per-request nonce changes it on every capture even when the visible text is identical. `list_revisions` detects this (distinct digests approaching one per capture) and falls back to hashing the chrome-stripped text of up to 24 evenly-spaced captures. That works, but it is **sampled**: revision boundaries are accurate to the sampling interval rather than to the day. Narrow `from`/`to` and re-run to sharpen a boundary. The output always says which method produced it. Text mode costs one capture fetch per sample, so it is bounded by the rate limiter — raising `RATE_LIMIT_PER_MINUTE` gives a finer sample.
+- **All archive.org requests share one rate budget.** The default is 60 requests/minute (`ARCHIVE_RPM`), and requests **queue** rather than fail — a burst makes everything slower rather than losing work. Only a projected wait beyond 60 seconds becomes an error, and it reports the wait and the queue depth. This matters most for `list_revisions` in text-digest mode, which spends one fetch per sampled capture: at the default budget a 24-capture sample takes roughly 25 seconds, and raising `ARCHIVE_RPM` makes it finer and faster. Parallel calls for the same URL are deduplicated into one upstream request.
+- **CDX content digests are unreliable on many modern pages.** The Wayback digest is a hash of the delivered bytes, so a Next.js build id or an embedded per-request nonce changes it on every capture even when the visible text is identical. The divergence starts well below one digest per capture: `python.org/about/` over 2014-2016 yields 49 "revisions" from 60 captures — a ratio of 0.82 — where the churn is a rotating sidebar and the body changed twice. `list_revisions` therefore uses three triggers (a distinct-digest ratio at or above 0.6, more than 60% of revisions covering a single capture, or a long run of near-identical sizes) and falls back to hashing the chrome-stripped text of up to 24 evenly-spaced captures. That works, but it is **sampled**: revision boundaries are accurate to the sampling interval rather than to the day. Narrow `from`/`to` and re-run to sharpen a boundary. The output always says which method produced it. Text mode costs one capture fetch per sample, so it is bounded by the rate limiter — raising `RATE_LIMIT_PER_MINUTE` gives a finer sample.
 - **Client-rendered pages extract to almost nothing.** If the text lives in JavaScript that never ran, there is no text in the capture to extract, whatever `format` you ask for. Both Anthropic pricing pages are examples: the capture is a shell. `archive_stats` and `search_snapshots` still work on them; `get_snapshot` and `compare_snapshots` will look empty, and that is the capture's fault rather than the extractor's.
 - **Chrome stripping is heuristic.** `nav`, `header`, `footer`, `aside`, cookie banners and language switchers are removed, which is what makes diffs readable — but a page that puts real content in a `<header>` will lose it. Use `format=raw` (via the resource route) to see the untouched capture.
 - **`list_screenshots` is unverified against the live CDX index.** It queries the `screenshot:` pseudo-URL, which is how Save Page Now screenshots are indexed; it could not be exercised against the real service from the build environment.

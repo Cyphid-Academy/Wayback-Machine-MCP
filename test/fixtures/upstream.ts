@@ -14,8 +14,17 @@ import {
   PREFIX_ORIGINALS,
   PREFIX_SLUG_A,
   PREFIX_STEM,
+  CHURN_CAPTURES,
+  CHURN_URL,
+  MARKUP_ONLY_CAPTURES,
+  MARKUP_ONLY_URL,
   REDIRECT_ONLY_CAPTURES,
   REDIRECT_ONLY_URL,
+  SHELL_CAPTURES,
+  SHELL_URL,
+  churnPageHtml,
+  markupOnlyHtml,
+  shellHtml,
   SEARCH_DOCS,
   TARGET_URL,
   noncePageHtml,
@@ -44,6 +53,9 @@ const SITES: readonly FixtureSite[] = [
   { url: MIXED_STATUS_URL, captures: MIXED_STATUS_CAPTURES },
   { url: GAP_URL, captures: GAP_CAPTURES },
   { url: NONCE_URL, captures: NONCE_CAPTURES, bodyFor: noncePageHtml },
+  { url: CHURN_URL, captures: CHURN_CAPTURES, bodyFor: churnPageHtml },
+  { url: MARKUP_ONLY_URL, captures: MARKUP_ONLY_CAPTURES, bodyFor: markupOnlyHtml },
+  { url: SHELL_URL, captures: SHELL_CAPTURES, bodyFor: () => shellHtml() },
 ];
 
 /**

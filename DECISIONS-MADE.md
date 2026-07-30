@@ -26,26 +26,60 @@ setting it and re-attaching the connector, with no code change either way.
 addable as another `AuthProvider` implementation without touching transport or
 routing code.
 
-### 2. Does claude.ai resolve a `ResourceLink` from a tool result?
+### 2. Why were `ResourceLink`s unresolvable, and what reaches the model?
 
-**Settled: no, it does not.** Confirmed in live use — a `format="raw"` call returned
-the URI and its metadata, and the artifact itself never reached the model.
+Two separate findings, both established empirically. An earlier revision of this
+document blamed the client for the first of them; that was wrong and has been
+deleted rather than left to become institutional knowledge.
 
-This makes **server-side reduction load-bearing rather than a convenience**. The
-architecture is unchanged and vindicated: the whole investigation this server was
-built for was carried by `archive_stats`, `list_revisions` and `compare_snapshots`,
-all of which return their answer inline. But the consequences for the inline
-thresholds are real, and F8 acts on them:
+**Finding 2a — the server never implemented the MCP `resources` capability.**
+It emitted `resource_link` blocks while declaring no `resources` capability and
+implementing no `resources/read` handler, so **no** MCP client could resolve them.
+A client with full resource support failed just as hard, and for a reason the
+server controlled. This was not a claude.ai limitation. Fixed: the capability is
+declared, `resources/read` serves the same artifacts as the HTTP `/r/...` routes
+keyed by the same URIs, and `resources/templates/list` describes what is readable
+(the addressable set is every capture in the Wayback Machine, so a fixed
+`resources/list` would be meaningless and is empty by design).
 
-- The 8,000-character threshold is a **hard wall in this client**, not a soft handoff. `get_snapshot` therefore takes an opt-in `maxChars` (default 8,000, ceiling 100,000) and `compare_snapshots` takes the same (default 15,000).
-- `maxChars` means "inline up to this many characters". Only the *default* value produces the preview-plus-resource-link shape; any other value the caller sets is honoured literally, with a `[Truncated at n of m characters…]` marker. That is the least surprising reading of an explicit budget.
-- This is **opt-in escalation, not paging.** There is deliberately no `offset` parameter and no chunking of a document across calls; that design was considered and rejected because it multiplies round trips and dumps markup into context.
-- Resource links are still emitted and still correct. They remain useful from Claude Code, Cowork and a browser, and the integration suite fetches the advertised URI and asserts it serves the full artifact.
+**Finding 2b — this client surfaces only `structuredContent` and drops text
+blocks.** Verified directly: `archive_stats` was called against the deployed
+server through a connector, and the result contained the JSON object alone. That
+server's `defineTool` provably emits a prose text block — dozens of tests assert
+on that prose — so the block was constructed, sent, and suppressed on arrival.
+It also explains why `resource_link` blocks in the same array *did* arrive: the
+client is filtering by block type, not discarding the array.
 
-The original probe procedure, retained in case another host needs testing: call
-`get_snapshot` on a page whose extracted text exceeds the limit, then ask a
-question whose answer appears only after the preview. If the model can answer, the
-host resolved the link.
+Together these determine the output contract:
+
+- **Inline first, link as an addition, never link as a substitute.** Link
+  resolution cannot be relied on across clients even with the capability
+  implemented. `format="raw"` is the sole exception, because raw bytes are
+  explicitly not for inlining.
+- **Anything the caller must act on appears in both channels.** A warning that
+  exists only in prose may never reach the model; one that exists only in
+  structured data is easy to skim past. So every tool returns exactly one
+  `TextContent` block — the prose summary, then the payload — and
+  `structuredContent` carrying the typed data, a `summary` field with the same
+  prose, and the payload in a named field (`text` for `get_snapshot`, `diff` for
+  `compare_snapshots`).
+- **The text block is never JSON.** A smoke test asserts that for every tool.
+- The duplication costs size, so the payload counts twice against the result cap.
+  `defineTool` enforces a combined ceiling of 120,000 characters and, past it, the
+  text block defers to `structuredContent` rather than risk a call that fails
+  outright.
+
+### 2c. The 2,000-character preview never existed
+
+The tool description promised that text over 8,000 characters returns "a
+2,000-character preview plus a resource link", and an earlier fix spec asked to
+"keep the 2,000-character preview behaviour". There was no such behaviour to keep:
+the preview was computed and then discarded along with the rest of the text.
+
+Rather than implement a promise that was the wrong shape anyway, the threshold now
+means what a reader would expect: **inline up to `maxChars`, then say what was
+cut.** `textPayload` always returns content, and the description no longer
+promises a preview.
 
 ---
 
@@ -137,6 +171,42 @@ capture reports that the capture may be unavailable upstream and suggests a
 neighbouring timestamp. Only a connect-level failure against archive.org itself
 mentions outbound network access. The retry schedule is one attempt plus three
 retries at 250ms, 1s and 3s.
+
+### Findings from the independent capability test
+
+**The 0.9 distinct-digest threshold was too lax.** Verified counterexample:
+`python.org/about/` over 2014-2016 gives 49 revisions from 60 captures — a ratio
+of 0.82, under the threshold, and the output was as useless as the 88-row case the
+fallback was built for. 31 of those revisions were consecutive singletons whose
+byte length merely oscillated between 7,946 and 8,285 as a success-story sidebar
+rotated. The threshold is now 0.6, backed by two triggers that do not depend on
+the ratio at all: more than 60% of revisions covering a single capture (the shape
+a per-request token produces), and a run of more than ten consecutive revisions
+whose sizes differ by under 2% (churning boilerplate). Whichever fired is reported
+as `fallbackReason`.
+
+**The rate limiter rejected work it could have absorbed.** Ten requests per minute
+is far below what archive.org tolerates for CDX and `id_` fetches, and rejecting
+rather than queueing meant callers lost whole calls to the server's own throttle —
+and made a 24-fetch text-digest pass impossible. Now: requests queue for up to 60
+seconds and only a longer projected wait becomes a `rate_limited` error, which
+states the wait and the queue depth; the default is 60/minute via `ARCHIVE_RPM`;
+and parallel callers asking for the same URL share one request and therefore one
+token.
+
+**`truncated` and `bodyTruncated` disagreed about the same artifact.**
+`bodyTruncated` is deleted. `truncated` now means exactly one thing — the text in
+this response is shorter than the full artifact — so it is false when the body was
+fully inlined and false for `format="raw"`, where inlining is not attempted.
+`inlinedChars` alongside `totalChars` makes it derivable, which turns any
+disagreement into a test failure rather than a judgement call.
+
+**`list_screenshots` has no verified success path, and that is the finding.** No
+URL with a Save-Page-Now screenshot capture could be found to test a non-empty
+result against, so the tool is marked experimental in its own description. It now
+distinguishes `indexStatus: 'none'` (the index answered and holds none) from
+`'unavailable'` (the query itself failed), because returning `[]` for both made a
+broken query indistinguishable from the normal case.
 
 ---
 

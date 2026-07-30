@@ -3,11 +3,12 @@ import { getItemMetadataInput, getItemMetadataOutput, itemMetadataResponseSchema
 import { CACHE_TTL } from '../lib/cache.js';
 import { INLINE_TEXT_LIMIT, resourceLink, type ResourceLinkBlock } from '../lib/resources.js';
 import { failure } from '../lib/errors.js';
-import { defineTool, fail, succeed, type ToolModule } from './define.js';
+import { defineTool, fail, succeed, type ToolModule, type WithoutSummary } from './define.js';
 import { bytes, count, summary } from './format.js';
 
 type Input = z.infer<typeof getItemMetadataInput>;
 type Output = z.infer<typeof getItemMetadataOutput>;
+type Structured = WithoutSummary<Output>;
 type FileRow = z.infer<typeof getItemMetadataOutput>['files'][number];
 
 const TEXT_ROWS = 12;
@@ -105,7 +106,7 @@ export const getItemMetadataTool: ToolModule = defineTool<Input, Output>({
     const descriptionRaw = asText(metadata['description']);
     const needsLink = response.body.length > INLINE_TEXT_LIMIT || allFiles.length > files.length;
 
-    const structured: Output = {
+    const structured: Structured = {
       identifier,
       title: asText(metadata['title']),
       creator: asText(metadata['creator']),
@@ -152,6 +153,6 @@ export const getItemMetadataTool: ToolModule = defineTool<Input, Output>({
     if (structured.filesTruncated) lines.push(`  File list capped at maxFiles=${String(input.maxFiles)} of ${count(allFiles.length)}.`);
     lines.push('', `Details page: ${structured.detailsUrl}`);
 
-    return succeed(structured, summary(lines), links);
+    return succeed(structured, summary(lines), { links });
   },
 });

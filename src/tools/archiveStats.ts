@@ -4,11 +4,12 @@ import { CACHE_TTL } from '../lib/cache.js';
 import { cdxSearch, statusBreakdown, type StatusBreakdown } from '../lib/wayback.js';
 import { normalizeTargetUrl, waybackCalendarUrl } from '../lib/urls.js';
 import { timestampToIso } from '../lib/timestamps.js';
-import { defineTool, fail, succeed, type ToolModule } from './define.js';
+import { defineTool, fail, succeed, type ToolModule, type WithoutSummary } from './define.js';
 import { count, shortDate, summary } from './format.js';
 
 type Input = z.infer<typeof archiveStatsInput>;
 type Output = z.infer<typeof archiveStatsOutput>;
+type Structured = WithoutSummary<Output>;
 
 const CDX_LIMIT = 10_000;
 /** Above this share of redirects, the URL has probably moved (F2). */
@@ -108,7 +109,7 @@ export const archiveStatsTool: ToolModule = defineTool<Input, Output>({
 
     const redirectShare = breakdown.total === 0 ? 0 : breakdown.redirects / breakdown.total;
 
-    const structured: Output = {
+    const structured: Structured = {
       url,
       totalCaptures,
       firstCapture,

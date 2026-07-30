@@ -76,8 +76,8 @@ export function isEphemeralHost(baseUrl: string): boolean {
 }
 
 export interface TextPayload {
-  /** Full text when it is small enough to inline, otherwise undefined. */
-  readonly inline: string | undefined;
+  /** The text to inline: the whole thing, or its first `limit` characters. */
+  readonly inline: string;
   /** First PREVIEW_CHARS characters. Always present. */
   readonly preview: string;
   readonly totalChars: number;
@@ -89,25 +89,18 @@ export interface TextPayload {
 export const MAX_INLINE_CHARS = 100_000;
 
 /**
- * The inline-versus-link decision, in one place so every tool behaves identically.
+ * How much of a text artifact to inline, and whether anything was left out.
  *
- * At the default limit an oversized document yields a 2,000-character preview plus
- * a resource link. When the caller opts into a higher `limit`, the text is inlined
- * up to that many characters — claude.ai does not resolve resource links, so the
- * escalation is the only way to see more (F8).
+ * Always inlines up to `limit`. The old behaviour — withholding everything past a
+ * threshold and offering a 2,000-character preview instead — was removed with G1:
+ * the preview was promised in the tool description but never actually emitted, and
+ * a link is not a substitute for content because link resolution cannot be relied
+ * on across clients.
  */
 export function textPayload(text: string, limit: number = INLINE_TEXT_LIMIT): TextPayload {
   const totalChars = text.length;
-  if (totalChars <= limit) {
-    return { inline: text, preview: text.slice(0, PREVIEW_CHARS), totalChars, truncated: false };
-  }
-  if (limit !== INLINE_TEXT_LIMIT) {
-    // The caller set an explicit budget, so honour it literally: inline up to
-    // `limit` characters and say what was cut. Only the default limit produces
-    // the preview-plus-resource-link shape.
-    return { inline: text.slice(0, limit), preview: text.slice(0, PREVIEW_CHARS), totalChars, truncated: true };
-  }
-  return { inline: undefined, preview: text.slice(0, PREVIEW_CHARS), totalChars, truncated: true };
+  const inline = text.slice(0, limit);
+  return { inline, preview: text.slice(0, PREVIEW_CHARS), totalChars, truncated: inline.length < totalChars };
 }
 
 /** The marker appended when an escalated inline read was still cut short (F8). */

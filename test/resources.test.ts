@@ -31,15 +31,13 @@ describe('textPayload — the 8,000 character threshold', () => {
     assert.equal(payload.truncated, false);
     assert.equal(payload.inline, text);
     assert.equal(payload.totalChars, INLINE_TEXT_LIMIT);
-    assert.equal(payload.preview.length, PREVIEW_CHARS);
   });
 
-  it('withholds text one character over the limit and previews 2,000 characters', () => {
+  it('inlines up to the limit and flags the cut when text is longer (G1)', () => {
     const text = 'a'.repeat(INLINE_TEXT_LIMIT + 1);
     const payload = textPayload(text);
     assert.equal(payload.truncated, true);
-    assert.equal(payload.inline, undefined);
-    assert.equal(payload.preview.length, PREVIEW_CHARS);
+    assert.equal(payload.inline.length, INLINE_TEXT_LIMIT, 'content is inlined, never withheld entirely');
     assert.equal(payload.totalChars, INLINE_TEXT_LIMIT + 1);
   });
 
@@ -105,10 +103,10 @@ describe('textPayload escalation (F8)', () => {
     assert.match(truncationNotice(12_000, 20_000), /higher maxChars/);
   });
 
-  it('inlines nothing beyond the preview at the default limit', () => {
+  it('still inlines at the default limit rather than withholding everything (G1)', () => {
     const payload = textPayload('a'.repeat(20_000));
-    assert.equal(payload.inline, undefined);
-    assert.equal(payload.preview.length, PREVIEW_CHARS);
+    assert.equal(payload.inline.length, INLINE_TEXT_LIMIT);
+    assert.equal(payload.truncated, true);
   });
 
   it('caps escalation at 100,000 characters', () => {
@@ -171,7 +169,7 @@ describe('config', () => {
     assert.equal(defaults.authToken, undefined);
     assert.equal(defaults.enableSave, false);
     assert.equal(defaults.jsonResponse, true);
-    assert.equal(defaults.rateLimitPerMinute, 10);
+    assert.equal(defaults.rateLimitPerMinute, 60, 'G4 raised the default archive.org budget');
     assert.equal(defaults.upstreamTimeoutMs, 25_000);
     assert.equal(defaults.host, '0.0.0.0');
     assert.equal(defaults.port, 3_000);
@@ -193,6 +191,8 @@ describe('config', () => {
   it('clamps out-of-range numeric settings', () => {
     assert.equal(loadConfig({ RATE_LIMIT_PER_MINUTE: '0' }).rateLimitPerMinute, 1);
     assert.equal(loadConfig({ RATE_LIMIT_PER_MINUTE: '99999' }).rateLimitPerMinute, 600);
+    assert.equal(loadConfig({ ARCHIVE_RPM: '120' }).rateLimitPerMinute, 120, 'ARCHIVE_RPM is the documented name');
+    assert.equal(loadConfig({ ARCHIVE_RPM: '120', RATE_LIMIT_PER_MINUTE: '5' }).rateLimitPerMinute, 120, 'ARCHIVE_RPM wins');
     assert.equal(loadConfig({ UPSTREAM_TIMEOUT_MS: '10' }).upstreamTimeoutMs, 1_000);
   });
 });

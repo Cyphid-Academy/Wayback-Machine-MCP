@@ -1,10 +1,11 @@
 import { z } from 'zod';
 import { clearCacheInput, clearCacheOutput } from '../schemas.js';
-import { defineTool, succeed, type ToolModule } from './define.js';
+import { defineTool, succeed, type ToolModule, type WithoutSummary } from './define.js';
 import { count } from './format.js';
 
 type Input = z.infer<typeof clearCacheInput>;
 type Output = z.infer<typeof clearCacheOutput>;
+type Structured = WithoutSummary<Output>;
 
 export const clearCacheTool: ToolModule = defineTool<Input, Output>({
   name: 'clear_cache',
@@ -22,7 +23,7 @@ export const clearCacheTool: ToolModule = defineTool<Input, Output>({
   output: clearCacheOutput,
   async run(_input, ctx) {
     const cleared = await ctx.cache.clear();
-    const structured: Output = { cleared, remaining: ctx.cache.size() };
+    const structured: Structured = { cleared, remaining: ctx.cache.size() };
     return succeed(structured, `Cleared ${count(cleared)} cached upstream response${cleared === 1 ? '' : 's'}.`);
   },
 });

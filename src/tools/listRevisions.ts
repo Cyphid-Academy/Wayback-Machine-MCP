@@ -13,11 +13,12 @@ import { failure } from '../lib/errors.js';
 import { normalizeTargetUrl, waybackCaptureUrl } from '../lib/urls.js';
 import { normalizeTimestamp, timestampToIso } from '../lib/timestamps.js';
 import { MAX_TABLE_ROWS } from '../lib/resources.js';
-import { defineTool, fail, succeed, type ToolModule } from './define.js';
+import { defineTool, fail, succeed, type ToolModule, type WithoutSummary } from './define.js';
 import { bytes, count, shortDate, summary } from './format.js';
 
 type Input = z.infer<typeof listRevisionsInput>;
 type Output = z.infer<typeof listRevisionsOutput>;
+type Structured = WithoutSummary<Output>;
 type Row = z.infer<typeof listRevisionsOutput>['revisions'][number];
 
 const TEXT_ROWS = 20;
@@ -25,7 +26,17 @@ const TEXT_ROWS = 20;
  * At or above this ratio of distinct digests to captures, the CDX digests are
  * noise rather than signal — the page embeds a build hash or per-request nonce (F4).
  */
-const NOISE_RATIO = 0.9;
+const NOISE_RATIO = 0.6;
+/**
+ * Second, ratio-independent trigger: pages with per-request tokens produce long
+ * runs of single-capture revisions, and that shape is a stronger signal than the
+ * ratio. Verified counterexample the ratio alone missed — python.org/about/ over
+ * 2014-2016 gives 49 revisions from 60 captures, a ratio of only 0.82 (G5).
+ */
+const SINGLETON_SHARE = 0.6;
+/** Third trigger: many revisions whose byte length barely moves is churning boilerplate. */
+const CHURN_TOLERANCE = 0.02;
+const CHURN_MIN_REVISIONS = 10;
 /** Hard ceiling on capture fetches in text-digest mode, per F4. */
 const MAX_TEXT_SAMPLES = 24;
 /** Wall-clock budget for the sampling pass, so a handler cannot run away. */
@@ -37,7 +48,7 @@ export const listRevisionsTool: ToolModule = defineTool<Input, Output>({
   name: 'list_revisions',
   title: 'Distinct content revisions of a URL',
   description:
-    'Turns hundreds of captures into the handful of times a page actually changed, and is the tool for reconstructing the edit history of a page rewritten in place at a stable URL. It first groups captures by the CDX content digest, which is free and exact — that works on server-rendered static pages. Many modern pages defeat it: a Next.js build hash or an embedded per-request nonce changes the digest on every capture even when the visible text is identical. When that is detected the tool automatically falls back to sampling up to 24 evenly-spaced captures, extracting and hashing the readable text of each, and grouping on that instead; revision boundaries are then accurate to the sampling interval rather than to the day, and narrowing from/to and re-running sharpens a boundary. The output always states which method produced it, how many captures were examined and how many were excluded. Feed two firstSeen values to compare_snapshots.',
+    'Turns hundreds of captures into the handful of times a page actually changed, and is the tool for reconstructing the edit history of a page rewritten in place at a stable URL. It first groups captures by the CDX content digest, which is free and exact — that works on server-rendered static pages. Many pages defeat it: a build hash, an embedded per-request nonce or a rotating sidebar changes the digest on every capture even when the visible text is identical. Three heuristics detect that — a high distinct-digest ratio, a preponderance of single-capture revisions, or a long run of near-identical sizes — and the tool then falls back to sampling up to 24 evenly-spaced captures, extracting and hashing the readable text of each, and grouping on that. Revision boundaries are then accurate to the sampling interval rather than to the day, so narrow from/to and re-run to sharpen one. The output always states which method produced it, which heuristic fired, how many captures were examined and how many were excluded. `method` forces either path. Text mode spends one archive.org fetch per sampled capture from a shared per-server budget. Feed two firstSeen values to compare_snapshots.',
   annotations: { title: 'Distinct content revisions of a URL', readOnlyHint: true, openWorldHint: true },
   input: listRevisionsInput,
   output: listRevisionsOutput,
@@ -93,8 +104,24 @@ export const listRevisionsTool: ToolModule = defineTool<Input, Output>({
     const digestRuns = groupRevisions(captures);
     const distinctDigests = new Set(captures.map((row) => row.digest)).size;
     const digestRatio = captures.length === 0 ? 0 : distinctDigests / captures.length;
-    const digestsAreNoise = digestRatio >= NOISE_RATIO && captures.length > 3;
+    const singletons = digestRuns.filter((run) => run.captureCount === 1).length;
+    const singletonShare = digestRuns.length === 0 ? 0 : singletons / digestRuns.length;
+
+    // G5: three independent triggers. The ratio alone let the exact failure this
+    // exists to catch pass straight through, so shape and size churn back it up.
+    let fallbackReason: string | null = null;
+    if (captures.length > 3) {
+      if (digestRatio >= NOISE_RATIO) {
+        fallbackReason = `${count(distinctDigests)} distinct digests across ${count(captures.length)} captures (ratio ${digestRatio.toFixed(2)})`;
+      } else if (singletonShare > SINGLETON_SHARE) {
+        fallbackReason = `${String(Math.round(singletonShare * 100))}% of revisions cover a single capture, the shape of a page with per-request tokens`;
+      } else if (isChurningBoilerplate(digestRuns)) {
+        fallbackReason = `over ${String(CHURN_MIN_REVISIONS)} consecutive revisions differ in size by under ${String(CHURN_TOLERANCE * 100)}%, which is churning boilerplate rather than content change`;
+      }
+    }
+    const digestsAreNoise = fallbackReason !== null;
     const useText = input.method === 'text' || (input.method === 'auto' && digestsAreNoise);
+    if (input.method === 'text' && fallbackReason === null) fallbackReason = 'requested explicitly with method="text"';
 
     const excludedReason = excluded === 0 ? null : 'not status 200';
     const exclusionLine =
@@ -105,7 +132,7 @@ export const listRevisionsTool: ToolModule = defineTool<Input, Output>({
     if (!useText) {
       const runs = digestRuns;
       const revisions = toRows(ctx.config.webArchiveBase, url, runs);
-      const structured: Output = {
+      const structured: Structured = {
         url,
         revisions: revisions.slice(0, MAX_TABLE_ROWS),
         totalRevisions: runs.length,
@@ -117,6 +144,8 @@ export const listRevisionsTool: ToolModule = defineTool<Input, Output>({
         excludedReason,
         digestRatio: Math.round(digestRatio * 1000) / 1000,
         capturesSampled: 0,
+        fallbackReason: null,
+        singletonShare: Math.round(singletonShare * 1000) / 1000,
         capturesTruncated,
         revisionsTruncated: runs.length > MAX_TABLE_ROWS,
         firstCapture: captures[0]?.timestamp ?? null,
@@ -132,7 +161,7 @@ export const listRevisionsTool: ToolModule = defineTool<Input, Output>({
       if (digestsAreNoise) {
         lines.push(
           '',
-          `Warning: ${count(distinctDigests)}/${count(captures.length)} digests are distinct, so this page probably embeds per-request tokens and these "revisions" are mostly noise. Re-run with method="text" (or "auto") for sampled text digesting.`,
+          `Warning: these "revisions" are probably noise — ${fallbackReason ?? 'digest churn detected'}. Re-run with method="text" (or "auto") for sampled text digesting.`,
         );
       }
       lines.push('', ...revisionLines(revisions));
@@ -169,7 +198,7 @@ export const listRevisionsTool: ToolModule = defineTool<Input, Output>({
 
     const runs = groupRevisions(hashed);
     const revisions = toRows(ctx.config.webArchiveBase, url, runs);
-    const structured: Output = {
+    const structured: Structured = {
       url,
       revisions: revisions.slice(0, MAX_TABLE_ROWS),
       totalRevisions: runs.length,
@@ -181,6 +210,8 @@ export const listRevisionsTool: ToolModule = defineTool<Input, Output>({
       excludedReason,
       digestRatio: Math.round(digestRatio * 1000) / 1000,
       capturesSampled: hashed.length,
+      fallbackReason,
+      singletonShare: Math.round(singletonShare * 1000) / 1000,
       capturesTruncated,
       revisionsTruncated: runs.length > MAX_TABLE_ROWS,
       firstCapture: hashed[0]?.timestamp ?? null,
@@ -192,7 +223,7 @@ export const listRevisionsTool: ToolModule = defineTool<Input, Output>({
       exclusionLine,
       rangeLine(structured.firstCapture, structured.lastCapture),
       '',
-      `CDX digests were unusable (${count(distinctDigests)}/${count(captures.length)} distinct — this page embeds per-request tokens). Fell back to text-digest mode over ${count(hashed.length)} evenly-spaced captures. Revision boundaries are accurate to the sampling interval, not to the day. Narrow from/to and re-run to sharpen a boundary.`,
+      `CDX digests were unusable — ${fallbackReason ?? 'digest churn detected'}. Fell back to text-digest mode: sampled ${count(hashed.length)} captures evenly spaced across the range. Revision boundaries are accurate to the sampling interval, not to the day. Narrow from/to and re-run to sharpen a boundary, or force method="digest" to see the raw index grouping.`,
       '',
       ...revisionLines(revisions),
     ];
@@ -257,7 +288,32 @@ function nextStep(revisions: readonly Row[], url: string): string[] {
   ];
 }
 
-function emptyOutput(url: string, total: number, excluded: number, capturesTruncated: boolean): Output {
+/**
+ * True when a long run of consecutive revisions differ in size by almost nothing —
+ * the signature of a rotating sidebar or advert rather than an edit (G5).
+ */
+function isChurningBoilerplate(runs: readonly { readonly length: string }[]): boolean {
+  let streak = 0;
+  let previous: number | undefined;
+  for (const run of runs) {
+    const size = Number.parseInt(run.length, 10);
+    if (!Number.isFinite(size) || size <= 0) {
+      previous = undefined;
+      streak = 0;
+      continue;
+    }
+    if (previous !== undefined && Math.abs(size - previous) / previous < CHURN_TOLERANCE) {
+      streak += 1;
+      if (streak > CHURN_MIN_REVISIONS) return true;
+    } else {
+      streak = 0;
+    }
+    previous = size;
+  }
+  return false;
+}
+
+function emptyOutput(url: string, total: number, excluded: number, capturesTruncated: boolean): Structured {
   return {
     url,
     revisions: [],
@@ -270,6 +326,8 @@ function emptyOutput(url: string, total: number, excluded: number, capturesTrunc
     excludedReason: excluded === 0 ? null : 'not status 200',
     digestRatio: 0,
     capturesSampled: 0,
+    fallbackReason: null,
+    singletonShare: 0,
     capturesTruncated,
     revisionsTruncated: false,
     firstCapture: null,

@@ -5,7 +5,11 @@ import { loadConfig } from '../src/config.js';
 import { createApp, createRuntime, type Runtime } from '../src/index.js';
 import { startFixtureUpstream, type FixtureUpstream } from './fixtures/upstream.js';
 import {
+  CHURN_URL,
   GAP_URL,
+  MARKUP_ONLY_PAIR,
+  MARKUP_ONLY_URL,
+  SHELL_URL,
   IDENTICAL_TEXT_PAIR,
   MIXED_STATUS_URL,
   NONCE_URL,
@@ -650,10 +654,11 @@ describe('get_snapshot', () => {
     assert.match(str(result.structuredContent, 'resolvedUrl'), /id_\//, 'fetched with the id_ modifier');
   });
 
-  it('returns a preview plus a ResourceLink when the text exceeds 8,000 characters', async () => {
+  it('inlines up to the budget plus a ResourceLink when the text exceeds it (G1)', async () => {
     const result = await callTool('get_snapshot', { url: TARGET_URL, timestamp: 'latest' });
     assert.equal(result.structuredContent?.['truncated'], true);
     assert.ok(num(result.structuredContent, 'totalChars') > 8_000);
+    assert.equal(num(result.structuredContent, 'inlinedChars'), 8_000, 'content is inlined, not withheld');
     const links = linksOf(result);
     assert.equal(links.length, 1);
     const link = links[0];
@@ -664,7 +669,7 @@ describe('get_snapshot', () => {
     assert.ok((link?.size ?? 0) > 8_000);
     assert.ok((link?.name ?? '').length > 0, 'a ResourceLink must carry a name');
     assert.ok((link?.description ?? '').length > 0);
-    assert.match(textOf(result), /Preview \(first/);
+    assert.match(textOf(result), /Truncated at 8,000 of/);
     assert.ok(textOf(result).length < num(result.structuredContent, 'totalChars'));
   });
 
@@ -673,7 +678,7 @@ describe('get_snapshot', () => {
     const text = textOf(result);
     assert.ok(!text.includes('<html'), 'raw HTML must never reach the content channel');
     assert.ok(!text.includes('<div'));
-    assert.match(text, /never inlines the capture/);
+    assert.match(text, /returns no inline content by design/);
     assert.equal(linksOf(result).length, 1);
   });
 
@@ -1185,7 +1190,8 @@ describe('F4 — digest collapse falls back when digests are noise', () => {
     assert.equal(num(result.structuredContent, 'totalRevisions'), 88);
     assert.equal(str(result.structuredContent, 'method'), 'digest');
     assert.ok(num(result.structuredContent, 'digestRatio') >= 0.9);
-    assert.match(textOf(result), /probably embeds per-request tokens/, 'digest mode warns that the result is noise');
+    assert.match(textOf(result), /probably noise/, 'digest mode warns that the result is noise');
+    assert.match(textOf(result), /ratio 1\.00/);
   });
 
   it('collapses the same captures to a single-digit revision count in auto mode', async () => {
@@ -1201,9 +1207,9 @@ describe('F4 — digest collapse falls back when digests are noise', () => {
 
   it('states the method and its precision limits', async () => {
     const text = textOf(await callTool('list_revisions', { url: NONCE_URL }));
-    assert.match(text, /CDX digests were unusable \(88\/88 distinct/);
-    assert.match(text, /per-request tokens/);
-    assert.match(text, /text-digest mode over \d+ evenly-spaced captures/);
+    assert.match(text, /CDX digests were unusable/);
+    assert.match(text, /88 distinct digests across 88 captures/);
+    assert.match(text, /sampled \d+ captures evenly spaced/);
     assert.match(text, /accurate to the sampling interval, not to the day/);
     assert.match(text, /Narrow from\/to and re-run to sharpen a boundary/);
   });
@@ -1333,18 +1339,18 @@ describe('F7 — one bad capture does not kill a comparison', () => {
 });
 
 describe('F8 — inline budget is opt-in escalatable', () => {
-  it('defaults to a preview plus a link for a long page', async () => {
+  it('inlines the default budget and links to the rest for a long page', async () => {
     const result = await callTool('get_snapshot', { url: TARGET_URL, timestamp: 'latest' });
     assert.equal(num(result.structuredContent, 'maxChars'), 8_000);
     assert.equal(result.structuredContent?.['truncated'], true);
-    assert.ok(num(result.structuredContent, 'inlinedChars') <= 2_000);
+    assert.equal(num(result.structuredContent, 'inlinedChars'), 8_000);
     assert.equal(linksOf(result).length, 1);
   });
 
   it('inlines more when asked, and still attaches the link', async () => {
     const result = await callTool('get_snapshot', { url: TARGET_URL, timestamp: 'latest', maxChars: 50_000 });
     const totalChars = num(result.structuredContent, 'totalChars');
-    assert.ok(num(result.structuredContent, 'inlinedChars') > 2_000, 'escalation must inline more than the preview');
+    assert.ok(num(result.structuredContent, 'inlinedChars') > 8_000, 'escalation must inline more than the default');
     assert.equal(linksOf(result).length, totalChars > 50_000 ? 1 : 0);
     assert.match(textOf(result), /45 messages every 5 hours/, 'content past the preview is now visible');
   });
@@ -1367,5 +1373,321 @@ describe('F8 — inline budget is opt-in escalatable', () => {
     assert.ok(num(tight.structuredContent, 'inlinedChars') <= 1_000);
     const roomy = await callTool('compare_snapshots', { url: TARGET_URL, maxChars: 100_000 });
     assert.ok(num(roomy.structuredContent, 'inlinedChars') >= num(tight.structuredContent, 'inlinedChars'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regressions for the independent capability test (waybackmcpFIXES2.md).
+// ---------------------------------------------------------------------------
+
+describe('G0 — the output contract', () => {
+  const everyTool = [
+    { name: 'archive_stats', args: { url: TARGET_URL } },
+    { name: 'check_availability', args: { url: TARGET_URL } },
+    { name: 'search_snapshots', args: { url: TARGET_URL, limit: 3 } },
+    { name: 'list_revisions', args: { url: TARGET_URL, method: 'digest' } },
+    { name: 'get_snapshot', args: { url: TARGET_URL, timestamp: 'earliest' } },
+    { name: 'compare_snapshots', args: { url: TARGET_URL } },
+    { name: 'list_screenshots', args: { url: TARGET_URL } },
+    { name: 'search_items', args: { query: 'apollo', rows: 2 } },
+    { name: 'get_item_metadata', args: { identifier: 'example-fixture-item' } },
+    { name: 'clear_cache', args: {} },
+  ];
+
+  it('every tool returns a non-empty text block that is not JSON', async () => {
+    for (const tool of everyTool) {
+      const result = await callTool(tool.name, tool.args);
+      assert.notEqual(result.isError, true, `${tool.name}: ${textOf(result)}`);
+      const blocks = (result.content ?? []).filter((block) => block.type === 'text');
+      assert.equal(blocks.length, 1, `${tool.name} should return exactly one text block`);
+      const text = blocks[0]?.text ?? '';
+      assert.ok(text.trim().length > 0, `${tool.name} text block is empty`);
+      let parsedAsJson = true;
+      try {
+        JSON.parse(text);
+      } catch {
+        parsedAsJson = false;
+      }
+      assert.equal(parsedAsJson, false, `${tool.name} put JSON in the text block instead of prose`);
+    }
+  });
+
+  it('repeats the summary in structuredContent so a client that drops text blocks still sees it', async () => {
+    for (const tool of everyTool) {
+      const result = await callTool(tool.name, tool.args);
+      const summary = str(result.structuredContent, 'summary');
+      assert.ok(summary.trim().length > 0, `${tool.name} has no summary field`);
+      const text = (result.content ?? []).find((block) => block.type === 'text')?.text ?? '';
+      assert.ok(text.startsWith(summary.split('\n')[0] ?? ''), `${tool.name}: summary and text block disagree`);
+    }
+  });
+
+  it('puts warnings in both channels, not prose only', async () => {
+    const result = await callTool('get_snapshot', { url: GAP_URL, timestamp: '20241020' });
+    // The offset is both a discrete field and a sentence in the summary.
+    assert.ok(Math.abs(num(result.structuredContent, 'offsetDays')) > 3);
+    assert.match(str(result.structuredContent, 'summary'), /Note: nearest capture/);
+  });
+});
+
+describe('G1 — get_snapshot returns the page', () => {
+  it('returns the whole body for a short capture', async () => {
+    const result = await callTool('get_snapshot', { url: TARGET_URL, timestamp: 'earliest' });
+    const body = str(result.structuredContent, 'text');
+    assert.ok(body.length > 0, 'a short capture must not come back empty');
+    assert.equal(body.length, num(result.structuredContent, 'totalChars'));
+    assert.equal(num(result.structuredContent, 'inlinedChars'), body.length);
+    assert.equal(result.structuredContent?.['truncated'], false);
+    assert.equal(result.structuredContent?.['resourceUri'], null, 'nothing withheld means no link needed');
+    assert.match(body, /How many messages can I send\?/);
+    assert.match(textOf(result), /How many messages can I send\?/, 'and in the text block too');
+  });
+
+  it('returns markdown for a short capture', async () => {
+    const result = await callTool('get_snapshot', { url: TARGET_URL, timestamp: 'earliest', format: 'markdown' });
+    const body = str(result.structuredContent, 'text');
+    assert.equal(body.length, num(result.structuredContent, 'totalChars'));
+    assert.match(body, /^# How many messages can I send\?$/m);
+  });
+
+  it('returns maxChars of body plus a link for a long capture', async () => {
+    const result = await callTool('get_snapshot', { url: TARGET_URL, timestamp: 'latest' });
+    const body = str(result.structuredContent, 'text');
+    const total = num(result.structuredContent, 'totalChars');
+    assert.ok(total > 8_000);
+    assert.equal(body.length, 8_000, 'inlined length is min(totalChars, maxChars)');
+    assert.equal(num(result.structuredContent, 'inlinedChars'), 8_000);
+    assert.equal(linksOf(result).length, 1, 'and a link to the remainder');
+  });
+
+  it('never leaves the caller with no content and no link', async () => {
+    for (const args of [
+      { url: TARGET_URL, timestamp: 'earliest' },
+      { url: TARGET_URL, timestamp: 'latest' },
+      { url: TARGET_URL, timestamp: 'earliest', format: 'markdown' },
+      { url: TARGET_URL, timestamp: 'earliest', format: 'raw' },
+      { url: TARGET_URL, timestamp: 'latest', maxChars: 1_000 },
+    ]) {
+      const result = await callTool('get_snapshot', args);
+      const inlined = num(result.structuredContent, 'inlinedChars');
+      if (inlined === 0) {
+        assert.notEqual(result.structuredContent?.['resourceUri'], null, `${JSON.stringify(args)} returned neither content nor a link`);
+      }
+    }
+  });
+});
+
+describe('G2 — compare_snapshots returns the diff', () => {
+  it('emits the diff, and its counts match the diff body', async () => {
+    const result = await callTool('compare_snapshots', { url: TARGET_URL });
+    assert.notEqual(result.isError, true, textOf(result));
+    const diff = str(result.structuredContent, 'diff');
+    assert.ok(diff.length > 0, 'the diff was computed and must not be discarded');
+    assert.equal(result.structuredContent?.['identical'], false);
+
+    // The assertion that would have caught the bug: the reported counts must
+    // describe the diff that was actually returned.
+    let added = 0;
+    let removed = 0;
+    for (const line of diff.split('\n')) {
+      if (line.startsWith('+') && !line.startsWith('+++')) added += line.length - 1;
+      else if (line.startsWith('-') && !line.startsWith('---')) removed += line.length - 1;
+    }
+    assert.equal(added, num(result.structuredContent, 'addedChars'));
+    assert.equal(removed, num(result.structuredContent, 'removedChars'));
+    assert.match(diff, /100 messages every 8 hours/);
+    assert.match(diff, /45 messages every 5 hours/);
+    assert.match(textOf(result), /45 messages every 5 hours/, 'and in the text block too');
+  });
+
+  it('emits a word-granularity diff too', async () => {
+    const result = await callTool('compare_snapshots', { url: TARGET_URL, granularity: 'word' });
+    const diff = str(result.structuredContent, 'diff');
+    assert.ok(diff.length > 0);
+    assert.match(diff, /^\+ /m);
+  });
+
+  it('never returns neither diff nor link', async () => {
+    for (const args of [{ url: TARGET_URL }, { url: TARGET_URL, maxChars: 1_000 }, { url: TARGET_URL, granularity: 'word' }]) {
+      const result = await callTool('compare_snapshots', args);
+      if (num(result.structuredContent, 'inlinedChars') === 0) {
+        assert.notEqual(result.structuredContent?.['resourceUri'], null, `${JSON.stringify(args)} returned nothing usable`);
+      }
+    }
+  });
+});
+
+describe('G3 — resources are actually served', () => {
+  it('declares the resources capability on initialize', async () => {
+    const { body } = await rpc('initialize', {
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: 'g3', version: '1.0.0' },
+    });
+    const capabilities = asRecord(resultObject(body)['capabilities']);
+    assert.ok(capabilities?.['resources'] !== undefined, 'links are advertised, so the capability must be declared');
+  });
+
+  it('lists resource templates covering both artifact kinds', async () => {
+    const { body } = await rpc('resources/templates/list');
+    const templates = resultObject(body)['resourceTemplates'];
+    assert.ok(Array.isArray(templates) && templates.length === 2);
+    const uris = templates.map((entry) => asString(asRecord(entry)?.['uriTemplate']) ?? '');
+    assert.ok(uris.some((uri) => uri.includes('/snapshot/')));
+    assert.ok(uris.some((uri) => uri.includes('/diff/')));
+  });
+
+  it('reads back a URI that a tool actually emitted', async () => {
+    const snapshot = await callTool('get_snapshot', { url: TARGET_URL, timestamp: 'latest' });
+    const uri = linksOf(snapshot)[0]?.uri ?? '';
+    assert.ok(uri.length > 0);
+
+    const { body } = await rpc('resources/read', { uri });
+    const contents = resultObject(body)['contents'];
+    assert.ok(Array.isArray(contents) && contents.length === 1);
+    const entry = asRecord(contents[0]);
+    assert.equal(asString(entry?.['uri']), uri);
+    assert.equal(asString(entry?.['mimeType']), 'text/plain');
+    const text = asString(entry?.['text']) ?? '';
+    assert.equal(text.length, num(snapshot.structuredContent, 'totalChars'), 'the full artifact, not the inlined slice');
+    assert.match(text, /45 messages every 5 hours/);
+  });
+
+  it('reads back a diff URI', async () => {
+    const compare = await callTool('compare_snapshots', { url: TARGET_URL, maxChars: 1_000 });
+    const uri = linksOf(compare)[0]?.uri ?? '';
+    assert.ok(uri.length > 0, 'a capped diff must advertise a link');
+    const { body } = await rpc('resources/read', { uri });
+    const contents = resultObject(body)['contents'];
+    assert.ok(Array.isArray(contents));
+    const entry = asRecord(contents[0]);
+    const text = asString(entry?.['text']) ?? '';
+    assert.ok(text.length > num(compare.structuredContent, 'inlinedChars'), 'the uncapped diff');
+    assert.match(text, /^--- /m);
+  });
+
+  it('rejects a URI it did not emit, with a useful message', async () => {
+    const { body } = await rpc('resources/read', { uri: 'https://example.com/not-ours' });
+    assert.ok(body.error !== undefined, 'an unknown URI must not silently succeed');
+    assert.match(body.error?.message ?? '', /Unknown resource URI|snapshot/);
+  });
+});
+
+describe('G5 — noise detection catches the low-ratio case', () => {
+  it('falls back on a singleton-heavy page whose ratio is only 0.82', async () => {
+    const digest = await callTool('list_revisions', { url: CHURN_URL, method: 'digest' });
+    const ratio = num(digest.structuredContent, 'digestRatio');
+    assert.ok(ratio < 0.9 && ratio > 0.7, `fixture ratio should sit below the old 0.9 threshold, got ${String(ratio)}`);
+    assert.ok(num(digest.structuredContent, 'totalRevisions') > 40, 'digest mode reproduces the useless output');
+
+    const auto = await callTool('list_revisions', { url: CHURN_URL });
+    assert.equal(str(auto.structuredContent, 'method'), 'text', 'auto must catch what the ratio alone missed');
+    assert.ok(num(auto.structuredContent, 'totalRevisions') < 10, 'single-digit revisions in auto mode');
+  });
+
+  it('reports which trigger fired', async () => {
+    const auto = await callTool('list_revisions', { url: CHURN_URL });
+    const reason = str(auto.structuredContent, 'fallbackReason');
+    assert.ok(reason.length > 0);
+    assert.match(reason, /single capture|ratio|churning boilerplate/);
+    assert.match(str(auto.structuredContent, 'summary'), /CDX digests were unusable/);
+    assert.ok(num(auto.structuredContent, 'singletonShare') > 0.6);
+  });
+
+  it('honours method="digest" as the escape hatch', async () => {
+    const forced = await callTool('list_revisions', { url: CHURN_URL, method: 'digest' });
+    assert.equal(str(forced.structuredContent, 'method'), 'digest');
+    assert.equal(forced.structuredContent?.['fallbackReason'], null);
+  });
+});
+
+describe('G6 — truncation flags are coherent', () => {
+  it('reports truncated=false for a raw link to a small artifact', async () => {
+    const result = await callTool('get_snapshot', { url: TARGET_URL, timestamp: 'earliest', format: 'raw' });
+    assert.equal(result.structuredContent?.['truncated'], false, 'nothing was cut; raw simply is not inlined');
+    assert.equal(num(result.structuredContent, 'inlinedChars'), 0);
+    assert.notEqual(result.structuredContent?.['resourceUri'], null);
+  });
+
+  it('has no bodyTruncated field left to disagree with truncated', async () => {
+    const result = await callTool('get_snapshot', { url: TARGET_URL, timestamp: 'earliest' });
+    assert.equal(result.structuredContent?.['bodyTruncated'], undefined, 'the overlapping flag was deleted');
+  });
+
+  it('makes truncated derivable from inlinedChars and totalChars', async () => {
+    for (const args of [
+      { url: TARGET_URL, timestamp: 'earliest' },
+      { url: TARGET_URL, timestamp: 'latest' },
+      { url: TARGET_URL, timestamp: 'latest', maxChars: 50_000 },
+    ]) {
+      const result = await callTool('get_snapshot', args);
+      const inlined = num(result.structuredContent, 'inlinedChars');
+      const total = num(result.structuredContent, 'totalChars');
+      assert.equal(result.structuredContent?.['truncated'], inlined < total, `flags disagree for ${JSON.stringify(args)}`);
+    }
+  });
+});
+
+describe('G7 — check_availability reports its offset', () => {
+  it('states the gap when the closest capture is far from the request', async () => {
+    const result = await callTool('check_availability', { url: GAP_URL, timestamp: '20241020' });
+    const offset = num(result.structuredContent, 'offsetDays');
+    assert.ok(Math.abs(offset) > 3, `expected a large offset, got ${String(offset)}`);
+    assert.match(str(result.structuredContent, 'summary'), /Note: nearest capture to 20241020/);
+  });
+
+  it('reports a null offset when no timestamp was requested', async () => {
+    const result = await callTool('check_availability', { url: GAP_URL });
+    assert.equal(result.structuredContent?.['offsetDays'], null);
+  });
+});
+
+describe('G8 — identical results and empty extractions are explained', () => {
+  it('names a markup-only change when text matches but digests differ', async () => {
+    const result = await callTool('compare_snapshots', {
+      url: MARKUP_ONLY_URL,
+      timestampA: MARKUP_ONLY_PAIR[0],
+      timestampB: MARKUP_ONLY_PAIR[1],
+    });
+    assert.equal(result.structuredContent?.['identical'], true);
+    assert.equal(result.structuredContent?.['markupOnlyChange'], true);
+    assert.notEqual(str(result.structuredContent, 'digestA'), str(result.structuredContent, 'digestB'));
+    assert.match(
+      str(result.structuredContent, 'summary'),
+      /Extracted text is identical, but the captures have different CDX digests/,
+    );
+  });
+
+  it('flags a capture that extracts to almost nothing', async () => {
+    const result = await callTool('get_snapshot', { url: SHELL_URL, timestamp: 'latest' });
+    assert.equal(result.structuredContent?.['extractionSuspect'], true);
+    const summary = str(result.structuredContent, 'summary');
+    assert.match(summary, /characters extracted from a .* HTML capture/);
+    assert.match(summary, /renders its content client-side/);
+    assert.match(summary, /format="raw"/);
+  });
+
+  it('does not flag a normal page', async () => {
+    const result = await callTool('get_snapshot', { url: TARGET_URL, timestamp: 'earliest' });
+    assert.equal(result.structuredContent?.['extractionSuspect'], false);
+  });
+});
+
+describe('G9 — list_screenshots distinguishes empty from broken', () => {
+  it('says the index answered and holds none', async () => {
+    const result = await callTool('list_screenshots', { url: TARGET_URL });
+    assert.equal(str(result.structuredContent, 'indexStatus'), 'none');
+    assert.match(str(result.structuredContent, 'summary'), /The index answered; it holds none/);
+  });
+
+  it('says so when the index could not be queried', async () => {
+    await callTool('clear_cache');
+    fixture.failNext(4, 503, 1);
+    const result = await callTool('list_screenshots', { url: TARGET_URL });
+    assert.equal(str(result.structuredContent, 'indexStatus'), 'unavailable');
+    assert.match(str(result.structuredContent, 'summary'), /could not be queried/);
+    assert.match(str(result.structuredContent, 'summary'), /not the same as "no screenshots exist"/);
+    fixture.failNext(0, 503);
+    await callTool('clear_cache');
   });
 });

@@ -75,8 +75,12 @@ const DEFAULT_MAX_BYTES = 6 * 1024 * 1024;
 /** One initial attempt plus three retries (F7). */
 const MAX_ATTEMPTS = 4;
 const BACKOFF_SCHEDULE_MS = [250, 1_000, 3_000];
-/** How long a caller will wait for a rate-limit slot before being told to retry. */
-const MAX_RATE_LIMIT_WAIT_MS = 12_000;
+/**
+ * G4: callers queue for a slot rather than being rejected — the server absorbs the
+ * throttle as latency instead of handing the caller a failure it could have
+ * avoided. Only a projected wait beyond this becomes a `rate_limited` error.
+ */
+const MAX_RATE_LIMIT_WAIT_MS = 60_000;
 
 const defaultSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => {
@@ -194,6 +198,11 @@ export class FetchUpstreamClient implements UpstreamClient {
   private readonly logger: Logger | undefined;
   private readonly fetchImpl: FetchImpl;
   private readonly sleep: (ms: number) => Promise<void>;
+  /**
+   * G4: parallel callers asking for the same URL share one upstream request and
+   * therefore one rate-limit token, instead of each spending one on the same bytes.
+   */
+  private readonly inFlight = new Map<string, Promise<HttpOutcome>>();
 
   constructor(deps: UpstreamClientDeps) {
     this.config = deps.config;
@@ -223,6 +232,19 @@ export class FetchUpstreamClient implements UpstreamClient {
       }
     }
 
+    const pending = this.inFlight.get(url);
+    if (pending !== undefined) return pending;
+
+    const attempt = this.requestAndCache(url, ttlMs, options);
+    this.inFlight.set(url, attempt);
+    try {
+      return await attempt;
+    } finally {
+      this.inFlight.delete(url);
+    }
+  }
+
+  private async requestAndCache(url: string, ttlMs: number, options: GetOptions): Promise<HttpOutcome> {
     const outcome = await this.request(url, {
       method: 'GET',
       accept: options.accept ?? '*/*',
@@ -312,14 +334,15 @@ export class FetchUpstreamClient implements UpstreamClient {
     for (let attempt = 1; attempt <= options.attempts; attempt += 1) {
       const slot = await this.limiter.acquire(options.maxWaitMs ?? MAX_RATE_LIMIT_WAIT_MS);
       if (!slot.ok) {
+        const seconds = Math.ceil(slot.retryAfterMs / 1000);
         return {
           ok: false,
           failure: failure(
             'rate_limited',
-            `Local rate limit for archive.org reached (${String(this.config.rateLimitPerMinute)} requests/minute).`,
+            `This server's archive.org request budget (${String(this.config.rateLimitPerMinute)}/minute) is saturated: the projected wait is ${String(seconds)}s with ${String(this.limiter.queueDepth())} request(s) already queued.`,
             {
               retryAfterMs: slot.retryAfterMs,
-              hint: 'Narrow the query (add from/to, lower limit) or wait before retrying.',
+              hint: 'Requests normally queue rather than fail, so this means sustained heavy use. Narrow the query (add from/to, lower limit), avoid parallel calls, or raise ARCHIVE_RPM.',
             },
           ),
         };

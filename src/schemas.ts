@@ -29,6 +29,17 @@ export function toJsonSchema(schema: z.ZodType, io: 'input' | 'output'): JsonSch
 // Shared field definitions
 // ---------------------------------------------------------------------------
 
+/**
+ * Present on every tool output. Some clients surface only `structuredContent`
+ * and drop text blocks, so the human-readable summary is carried here too —
+ * anything a caller must act on must be reachable from this channel (G0).
+ */
+const summaryField = {
+  summary: z
+    .string()
+    .describe('Human-readable summary of this result, identical to the text block. Read this first.'),
+};
+
 const urlField = z
   .string()
   .min(1)
@@ -61,6 +72,7 @@ export const statusBreakdownSchema = z.object({
 });
 
 export const archiveStatsOutput = z.object({
+  ...summaryField,
   url: z.string(),
   totalCaptures: z.number(),
   firstCapture: z.string().nullable(),
@@ -92,6 +104,7 @@ export const checkAvailabilityInput = z.object({
 });
 
 export const checkAvailabilityOutput = z.object({
+  ...summaryField,
   url: z.string(),
   available: z.boolean(),
   timestamp: z.string().nullable(),
@@ -99,6 +112,8 @@ export const checkAvailabilityOutput = z.object({
   snapshotUrl: z.string().nullable(),
   status: z.string().nullable(),
   requestedTimestamp: z.string().nullable(),
+  /** Signed days between the requested date and the closest capture (G7). */
+  offsetDays: z.number().nullable(),
 });
 
 // ---------------------------------------------------------------------------
@@ -143,6 +158,7 @@ export const snapshotRowSchema = z.object({
 });
 
 export const searchSnapshotsOutput = z.object({
+  ...summaryField,
   url: z.string(),
   matchType: z.string(),
   rows: z.array(snapshotRowSchema),
@@ -197,6 +213,7 @@ export const revisionRowSchema = z.object({
 });
 
 export const listRevisionsOutput = z.object({
+  ...summaryField,
   url: z.string(),
   revisions: z.array(revisionRowSchema),
   totalRevisions: z.number(),
@@ -213,6 +230,10 @@ export const listRevisionsOutput = z.object({
   digestRatio: z.number(),
   /** Captures actually fetched in text mode. 0 in digest mode. */
   capturesSampled: z.number(),
+  /** Which heuristic sent this into text-digest mode, or null in digest mode. */
+  fallbackReason: z.string().nullable(),
+  /** Share of revisions covering exactly one capture — a strong noise signal. */
+  singletonShare: z.number(),
   /** True when the capture list hit maxCaptures and older/newer captures were not examined. */
   capturesTruncated: z.boolean(),
   revisionsTruncated: z.boolean(),
@@ -252,6 +273,7 @@ export const getSnapshotInput = z.object({
 });
 
 export const getSnapshotOutput = z.object({
+  ...summaryField,
   url: z.string(),
   timestamp: z.string(),
   timestampIso: z.string(),
@@ -261,20 +283,26 @@ export const getSnapshotOutput = z.object({
   mimeType: z.string(),
   title: z.string().nullable(),
   format: z.string(),
-  /** Characters of extracted text. Distinct from artifactBytes — never conflate them. */
+  /**
+   * The extracted page content. This is the tool's actual output; everything else
+   * is metadata about it. Empty only for format="raw", where the bytes are served
+   * by the resource link instead.
+   */
+  text: z.string(),
+  /** Characters of extracted text in the whole capture. Not a byte count. */
   totalChars: z.number(),
   /** Byte length of the artifact the resource link serves. */
   artifactBytes: z.number(),
-  /** How many characters were actually inlined in this response. */
+  /** Characters actually delivered in `text`. With totalChars, makes `truncated` derivable. */
   inlinedChars: z.number(),
   maxChars: z.number(),
-  /** True when only a preview is inline and the full text is behind the resource link. */
+  /** True when `text` is shorter than the full artifact. False when the body was fully inlined, and false for format="raw". */
   truncated: z.boolean(),
   resourceUri: z.string().nullable(),
   /** Signed days between the requested date and the capture actually returned. */
   offsetDays: z.number().nullable(),
-  /** True when the upstream body hit the server's byte cap. */
-  bodyTruncated: z.boolean(),
+  /** True when an HTML capture yielded almost no text — usually a client-rendered page. */
+  extractionSuspect: z.boolean(),
 });
 
 // ---------------------------------------------------------------------------
@@ -305,6 +333,7 @@ export const compareSnapshotsInput = z.object({
 });
 
 export const compareSnapshotsOutput = z.object({
+  ...summaryField,
   url: z.string(),
   timestampA: z.string(),
   timestampB: z.string(),
@@ -324,13 +353,23 @@ export const compareSnapshotsOutput = z.object({
   changedSections: z.number(),
   charsA: z.number(),
   charsB: z.number(),
+  /** The unified diff itself, up to maxChars. This is the tool's actual output. */
+  diff: z.string(),
   diffTotalChars: z.number(),
   /** Byte length of the full diff artifact behind the resource link. */
   artifactBytes: z.number(),
+  /** Characters of diff actually delivered in `diff`. */
   inlinedChars: z.number(),
   maxChars: z.number(),
-  /** True when the unified diff was longer than the inline budget and was capped. */
+  /** True when `diff` is shorter than the full diff. */
   truncated: z.boolean(),
+  /** CDX content digests of the two captures, for telling markup-only changes apart. */
+  digestA: z.string().nullable(),
+  digestB: z.string().nullable(),
+  /** True when the extracted text matches but the CDX digests differ — a markup-only change. */
+  markupOnlyChange: z.boolean(),
+  /** True when either side yielded almost no text from an HTML capture. */
+  extractionSuspect: z.boolean(),
   resourceUri: z.string().nullable(),
   visualDiffUrl: z.string(),
   /** True when the diff algorithm timed out and only statistics are reliable. */
@@ -358,10 +397,13 @@ export const screenshotRowSchema = z.object({
 });
 
 export const listScreenshotsOutput = z.object({
+  ...summaryField,
   url: z.string(),
   screenshots: z.array(screenshotRowSchema),
   totalReturned: z.number(),
   hasMore: z.boolean(),
+  /** 'none' = the index answered and holds no screenshots; 'unavailable' = the index could not be queried. */
+  indexStatus: z.enum(['ok', 'none', 'unavailable']),
 });
 
 // ---------------------------------------------------------------------------
@@ -393,6 +435,7 @@ export const itemRowSchema = z.object({
 });
 
 export const searchItemsOutput = z.object({
+  ...summaryField,
   query: z.string(),
   items: z.array(itemRowSchema),
   numFound: z.number(),
@@ -417,6 +460,7 @@ export const itemFileSchema = z.object({
 });
 
 export const getItemMetadataOutput = z.object({
+  ...summaryField,
   identifier: z.string(),
   title: z.string().nullable(),
   creator: z.string().nullable(),
@@ -453,6 +497,7 @@ export const saveUrlInput = z.object({
 });
 
 export const saveUrlOutput = z.object({
+  ...summaryField,
   url: z.string(),
   jobId: z.string().nullable(),
   status: z.enum(['success', 'pending', 'error', 'submitted']),
@@ -470,6 +515,7 @@ export const saveUrlOutput = z.object({
 export const clearCacheInput = z.object({});
 
 export const clearCacheOutput = z.object({
+  ...summaryField,
   cleared: z.number(),
   remaining: z.number(),
 });

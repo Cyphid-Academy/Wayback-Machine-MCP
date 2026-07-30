@@ -3,11 +3,12 @@ import { saveStatusResponseSchema, saveSubmitResponseSchema, saveUrlInput, saveU
 import { CACHE_TTL } from '../lib/cache.js';
 import { failure } from '../lib/errors.js';
 import { absoluteUrl, normalizeTargetUrl, waybackCaptureUrl } from '../lib/urls.js';
-import { defineTool, fail, succeed, type ToolModule } from './define.js';
+import { defineTool, fail, succeed, type ToolModule, type WithoutSummary } from './define.js';
 import { shortDateTime, summary } from './format.js';
 
 type Input = z.infer<typeof saveUrlInput>;
 type Output = z.infer<typeof saveUrlOutput>;
+type Structured = WithoutSummary<Output>;
 
 /** Poll schedule for waitForCompletion, in milliseconds. Total ~18s. */
 const POLL_DELAYS = [3_000, 4_000, 5_000, 6_000];
@@ -78,7 +79,7 @@ export const saveUrlTool: ToolModule = defineTool<Input, Output>({
 
     const statusUrl = `${ctx.config.webArchiveBase}/save/status/${jobId}`;
     if (!input.waitForCompletion) {
-      const structured: Output = {
+      const structured: Structured = {
         url,
         jobId,
         status: 'submitted',
@@ -117,7 +118,7 @@ export const saveUrlTool: ToolModule = defineTool<Input, Output>({
     }
 
     const resolvedStatus: Output['status'] = status === 'success' ? 'success' : status === 'error' ? 'error' : 'pending';
-    const structured: Output = {
+    const structured: Structured = {
       url,
       jobId,
       status: resolvedStatus,

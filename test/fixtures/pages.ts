@@ -401,3 +401,120 @@ export const NONCE_CAPTURES: readonly FixtureCapture[] = buildNonceCaptures();
 
 /** The two real captures the fix spec says must hash identically (F4). */
 export const IDENTICAL_TEXT_PAIR: readonly [string, string] = ['20240308095154', '20240323002232'];
+
+// ---------------------------------------------------------------------------
+// Fixtures for the independent capability test (waybackmcpFIXES2.md).
+// ---------------------------------------------------------------------------
+
+/**
+ * G5: python.org/about/ over 2014-2016 — 60 captures, 49 distinct digests, a
+ * ratio of 0.82 that slipped under the original 0.9 threshold. The digests churn
+ * because a success-story sidebar rotates; the readable body changes twice.
+ * Sizes oscillate in a narrow band, matching the observed 7,946-8,285 bytes.
+ */
+export const CHURN_URL = 'example.org/about-churn';
+
+export interface ChurnEra {
+  readonly from: string;
+  readonly sentence: string;
+}
+
+export const CHURN_ERAS: readonly ChurnEra[] = [
+  { from: '20140101000000', sentence: 'Python is a programming language that lets you work quickly.' },
+  { from: '20150601000000', sentence: 'Python is a programming language that lets you work quickly and integrate systems effectively.' },
+];
+
+function churnEraFor(timestamp: string): ChurnEra {
+  let chosen = CHURN_ERAS[0];
+  for (const era of CHURN_ERAS) if (timestamp >= era.from) chosen = era;
+  if (chosen === undefined) throw new Error('fixture eras missing');
+  return chosen;
+}
+
+/** A rotating sidebar changes the bytes on most captures without changing the body. */
+export function churnPageHtml(timestamp: string): string {
+  const era = churnEraFor(timestamp);
+  const slot = Number(timestamp.slice(4, 8)) % 5;
+  return `<!doctype html>
+<html lang="en"><head><title>About Python | python.org</title></head>
+<body>
+${chrome()}
+<main><article>
+  <h1>About Python</h1>
+  <p>${era.sentence}</p>
+  <p>It runs everywhere and is developed in the open.</p>
+</article></main>
+<div class="sidebar-success-story">Success story ${String(slot)}: organisation ${String(slot)} uses Python in production for workload ${String(slot)}.</div>
+${footer()}
+</body></html>`;
+}
+
+function buildChurnCaptures(): FixtureCapture[] {
+  const rows: FixtureCapture[] = [];
+  const start = Date.parse('2014-01-15T00:00:00Z');
+  const end = Date.parse('2016-12-15T00:00:00Z');
+  const total = 60;
+  const step = (end - start) / (total - 1);
+  for (let index = 0; index < total; index += 1) {
+    const timestamp = stamp(new Date(start + step * index));
+    // 49 distinct digests across 60 captures: every fourth capture repeats its
+    // predecessor's digest, giving a ratio of ~0.82 with singleton-heavy runs.
+    const bucket = index % 4 === 3 ? index - 1 : index;
+    rows.push({
+      timestamp,
+      digest: `CHURN${String(bucket).padStart(10, '0')}AAAAAAAAAAAAAAAA`,
+      statuscode: '200',
+      mimetype: 'text/html',
+      // Oscillates in a narrow band, as the real page's markup does.
+      length: String(7_946 + ((index * 97) % 340)),
+    });
+  }
+  return rows;
+}
+
+export const CHURN_CAPTURES: readonly FixtureCapture[] = buildChurnCaptures();
+
+/**
+ * G8: two captures with different CDX digests whose extracted text is identical —
+ * the change was in a script tag. Mirrors the verified python.org pair.
+ */
+export const MARKUP_ONLY_URL = 'example.org/markup-only';
+export const MARKUP_ONLY_PAIR: readonly [string, string] = ['20120919084854', '20121102221304'];
+
+export const MARKUP_ONLY_CAPTURES: readonly FixtureCapture[] = [
+  { timestamp: '20120919084854', digest: 'MARKUPONLYAAAAAAAAAAAAAAAAAAAAAA', statuscode: '200', mimetype: 'text/html', length: '4200' },
+  { timestamp: '20121102221304', digest: 'MARKUPONLYBBBBBBBBBBBBBBBBBBBBBB', statuscode: '200', mimetype: 'text/html', length: '4260' },
+];
+
+/** Same visible body, different inline script — so the digests differ and the text does not. */
+export function markupOnlyHtml(timestamp: string): string {
+  return `<!doctype html>
+<html lang="en"><head><title>Stable Page</title>
+<script>var analyticsBuild="${timestamp}";</script>
+</head>
+<body>
+${chrome()}
+<main><article>
+  <h1>Stable Page</h1>
+  <p>This paragraph is byte-identical in both captures, which is the entire point of the fixture.</p>
+</article></main>
+${footer()}
+</body></html>`;
+}
+
+/** G8: a client-rendered page whose capture is only a shell. */
+export const SHELL_URL = 'example.org/client-rendered';
+
+export const SHELL_CAPTURES: readonly FixtureCapture[] = [
+  { timestamp: '20260101120000', digest: 'SHELLSHELLSHELLSHELLSHELLSHELLAA', statuscode: '200', mimetype: 'text/html', length: '12000' },
+];
+
+export function shellHtml(): string {
+  const filler = '/*'.padEnd(6_000, ' bundled application code ') + '*/';
+  return `<!doctype html>
+<html lang="en"><head><title>Pricing</title></head>
+<body>
+<div id="root"></div>
+<script>${filler}</script>
+</body></html>`;
+}

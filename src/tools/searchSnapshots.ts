@@ -4,11 +4,12 @@ import { cdxSearch } from '../lib/wayback.js';
 import { normalizeTargetUrl, waybackCaptureUrl } from '../lib/urls.js';
 import { normalizeTimestamp, timestampToIso } from '../lib/timestamps.js';
 import { MAX_TABLE_ROWS } from '../lib/resources.js';
-import { defineTool, fail, succeed, type ToolModule } from './define.js';
+import { defineTool, fail, succeed, type ToolModule, type WithoutSummary } from './define.js';
 import { count, shortDateTime, summary } from './format.js';
 
 type Input = z.infer<typeof searchSnapshotsInput>;
 type Output = z.infer<typeof searchSnapshotsOutput>;
+type Structured = WithoutSummary<Output>;
 type Row = z.infer<typeof searchSnapshotsOutput>['rows'][number];
 
 const TEXT_ROWS = 12;
@@ -78,7 +79,7 @@ export const searchSnapshotsTool: ToolModule = defineTool<Input, Output>({
 
     const distinctUrls = [...new Set(rows.map((row) => row.original).filter((original) => original.length > 0))];
 
-    const structured: Output = {
+    const structured: Structured = {
       url,
       matchType: input.matchType,
       rows,

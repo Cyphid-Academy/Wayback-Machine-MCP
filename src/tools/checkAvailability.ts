@@ -2,18 +2,19 @@ import { z } from 'zod';
 import { checkAvailabilityInput, checkAvailabilityOutput } from '../schemas.js';
 import { checkAvailability } from '../lib/wayback.js';
 import { normalizeTargetUrl } from '../lib/urls.js';
-import { normalizeTimestamp, timestampToIso } from '../lib/timestamps.js';
-import { defineTool, fail, succeed, type ToolModule } from './define.js';
+import { normalizeTimestamp, timestampToIso, timestampToMillis } from '../lib/timestamps.js';
+import { defineTool, fail, succeed, type ToolModule, type WithoutSummary } from './define.js';
 import { shortDateTime, summary } from './format.js';
 
 type Input = z.infer<typeof checkAvailabilityInput>;
 type Output = z.infer<typeof checkAvailabilityOutput>;
+type Structured = WithoutSummary<Output>;
 
 export const checkAvailabilityTool: ToolModule = defineTool<Input, Output>({
   name: 'check_availability',
   title: 'Closest capture to a date',
   description:
-    'Cheapest possible question: is this URL archived, and what is the nearest capture to a given date? One request, no page content. Use it as a prelude to get_snapshot when you have a date in mind but not a timestamp. Note that this endpoint can lag the CDX index — if it reports nothing but you expect captures, confirm with search_snapshots or archive_stats before giving up.',
+'Cheapest possible question: is this URL archived, and what is the nearest capture to a given date? One request, no page content. Use it as a prelude to get_snapshot when you have a date in mind but not a timestamp. The result reports offsetDays — how far the closest capture is from the date you asked for — because this is the tool whose answer everything downstream is built on, and an unnoticed gap here becomes a wrong date later. Note that this endpoint can lag the CDX index: if it reports nothing but you expect captures, confirm with search_snapshots or archive_stats before giving up.',
   annotations: { title: 'Closest capture to a date', readOnlyHint: true, openWorldHint: true },
   input: checkAvailabilityInput,
   output: checkAvailabilityOutput,
@@ -33,7 +34,14 @@ export const checkAvailabilityTool: ToolModule = defineTool<Input, Output>({
     if (!result.ok) return fail(result.failure);
     const info = result.value;
 
-    const structured: Output = {
+    // G7: F3's offset reporting applies here too — this tool is the prelude to
+    // picking a timestamp, so an unreported gap propagates into everything after it.
+    const offsetDays =
+      requested === undefined || info.timestamp === undefined
+        ? null
+        : Math.round((timestampToMillis(info.timestamp) - timestampToMillis(requested)) / 86_400_000);
+
+    const structured: Structured = {
       url,
       available: info.available && info.timestamp !== undefined,
       timestamp: info.timestamp ?? null,
@@ -41,6 +49,7 @@ export const checkAvailabilityTool: ToolModule = defineTool<Input, Output>({
       snapshotUrl: info.snapshotUrl ?? null,
       status: info.status ?? null,
       requestedTimestamp: requested ?? null,
+      offsetDays,
     };
 
     if (!structured.available || info.timestamp === undefined) {
@@ -53,9 +62,18 @@ export const checkAvailabilityTool: ToolModule = defineTool<Input, Output>({
       );
     }
 
+    const gapNotice =
+      offsetDays !== null && Math.abs(offsetDays) > 3
+        ? `Note: nearest capture to ${(requested ?? '').slice(0, 8)} is ${info.timestamp}, ${String(Math.abs(offsetDays))} day${
+            Math.abs(offsetDays) === 1 ? '' : 's'
+          } ${offsetDays > 0 ? 'later' : 'earlier'}. There are no captures in between.`
+        : '';
+
     return succeed(
       structured,
       summary([
+        gapNotice,
+        gapNotice === '' ? '' : '',
         `${url} is archived.`,
         `Closest capture: ${shortDateTime(info.timestamp)} (timestamp ${info.timestamp}, HTTP ${info.status ?? 'unknown'})`,
         info.snapshotUrl === undefined ? '' : `Replay: ${info.snapshotUrl}`,

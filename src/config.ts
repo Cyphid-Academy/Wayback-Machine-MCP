@@ -33,7 +33,13 @@ export interface Config {
 export type Env = Record<string, string | undefined>;
 
 const DEFAULT_PORT = 3000;
-const DEFAULT_RATE_LIMIT_PER_MINUTE = 10;
+/**
+ * G4: ten per minute is far below what archive.org tolerates for CDX and `id_`
+ * fetches, and it made a single text-digest `list_revisions` call impossible.
+ * The throttle exists to avoid provoking a 429, and it backs off automatically
+ * when one arrives, so the steady-state ceiling can be much higher.
+ */
+const DEFAULT_RATE_LIMIT_PER_MINUTE = 60;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 25_000;
 
 function str(env: Env, key: string): string | undefined {
@@ -142,7 +148,13 @@ export function loadConfig(env: Env = process.env): Config {
     webArchiveBase: stripTrailingSlash(str(env, 'WEB_ARCHIVE_BASE') ?? 'https://web.archive.org'),
     archiveBase: stripTrailingSlash(str(env, 'ARCHIVE_BASE') ?? 'https://archive.org'),
     userAgent: `wayback-mcp/1.0 (+${deploy.url}; ${contactEmail ?? 'unset@example.invalid'})`,
-    rateLimitPerMinute: int(env, 'RATE_LIMIT_PER_MINUTE', DEFAULT_RATE_LIMIT_PER_MINUTE, 1, 600),
+    rateLimitPerMinute: int(
+      env,
+      'ARCHIVE_RPM',
+      int(env, 'RATE_LIMIT_PER_MINUTE', DEFAULT_RATE_LIMIT_PER_MINUTE, 1, 600),
+      1,
+      600,
+    ),
     upstreamTimeoutMs: int(env, 'UPSTREAM_TIMEOUT_MS', DEFAULT_UPSTREAM_TIMEOUT_MS, 1_000, 120_000),
     jsonResponse: !bool(env, 'MCP_SSE', false),
     extraAllowedOrigins,

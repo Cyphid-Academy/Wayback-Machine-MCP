@@ -293,16 +293,51 @@ describe('FetchUpstreamClient — failures', () => {
     if (!result.ok) assert.equal(result.failure.code, 'network_error');
   });
 
-  it('denies with a rate_limited failure when the local budget is exhausted', async () => {
+  it('queues rather than failing when the budget is momentarily exhausted (G4)', async () => {
+    // Budget of 1/minute: the second request has to wait 60s, which is within the
+    // queue budget, so the server absorbs it as latency instead of erroring.
     const test = harness(() => ok('body'), { rateLimit: 1 });
     assert.equal((await test.client.get('https://web.archive.org/a')).ok, true);
-    const denied = await test.client.get('https://web.archive.org/b');
+    const queued = await test.client.get('https://web.archive.org/b');
+    assert.equal(queued.ok, true, 'a caller should not absorb a failure the server could absorb as delay');
+  });
+
+  it('only reports rate_limited when the projected wait exceeds the queue budget (G4)', async () => {
+    const test = harness(() => ok('body'), { rateLimit: 1 });
+    await test.client.get('https://web.archive.org/a');
+    await test.client.get('https://web.archive.org/b');
+    const denied = await test.client.get('https://web.archive.org/c');
     assert.equal(denied.ok, false);
     if (!denied.ok) {
       assert.equal(denied.failure.code, 'rate_limited');
-      assert.match(denied.failure.message, /1 requests\/minute/);
+      assert.match(denied.failure.message, /request budget \(1\/minute\) is saturated/);
+      assert.match(denied.failure.message, /projected wait is \d+s/);
       assert.ok(denied.failure.retryAfterMs !== undefined);
+      assert.match(denied.failure.hint ?? '', /ARCHIVE_RPM/);
     }
+  });
+
+  it('shares one upstream request between parallel callers asking for the same URL (G4)', async () => {
+    const test = harness(() => ok('shared'));
+    const [first, second, third] = await Promise.all([
+      test.client.get('https://web.archive.org/same'),
+      test.client.get('https://web.archive.org/same'),
+      test.client.get('https://web.archive.org/same'),
+    ]);
+    assert.equal(test.calls.length, 1, 'three callers, one fetch, one rate-limit token');
+    for (const result of [first, second, third]) {
+      assert.equal(result.ok && result.body, 'shared');
+    }
+  });
+
+  it('does not conflate different URLs when deduplicating', async () => {
+    const test = harness((url) => ok(url));
+    const [a, b] = await Promise.all([
+      test.client.get('https://web.archive.org/a'),
+      test.client.get('https://web.archive.org/b'),
+    ]);
+    assert.equal(test.calls.length, 2);
+    assert.notEqual(a.ok && a.body, b.ok && b.body);
   });
 });
 
